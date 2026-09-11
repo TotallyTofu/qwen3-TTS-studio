@@ -1,8 +1,8 @@
 # Qwen3-TTS Studio
 
-A professional-grade interface for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS), designed to unlock the model's full potential with fine-grained control and intuitive workflows.
+A professional-grade interface for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS), designed to unlock the model's full potential with fine-grained control and intuitive workflows. This fork accelerates real-time Qwen3-TTS inference using CUDA graph capture. No Flash Attention, no vLLM, no Triton. Just torch.cuda.CUDAGraph. Supports both streaming and non-streaming generation.
 
-This model enables Qwen3-TTS Instant voice cloning, If you want a serious finetuning, use https://github.com/bc-dunia/qwen3-TTS-finetune-studio
+This model enables Qwen3-TTS Instant voice cloning, If you want a serious finetuning, use https://github.com/bc-dunia/qwen3-TTS-finetune-studio. For more information about the inference engine check out https://github.com/andimarafioti/faster-qwen3-tts
 
 ![Qwen3-TTS Studio Screenshot](docs/screenshot.png)
 
@@ -131,7 +131,7 @@ Notes:
 - You can also enter provider/model/base URL/API key directly in the Podcast tab under **LLM Provider**.
 - Optional runtime env vars:
   - `QWEN_TTS_DEVICE` to force device selection (for example: `mps`, `cuda:0`, `cpu`)
-  - `QWEN_TTS_MIN_NEW_TOKENS` to adjust minimum generation length (default: `60`)
+  - `QWEN_TTS_MIN_NEW_TOKENS` to adjust minimum generation length (default: `12`)
   - `QWEN_TTS_ALLOW_OLD=1` to bypass the minimum `qwen-tts` version gate (not recommended)
 
 OpenRouter model options (examples in UI presets):
@@ -335,6 +335,7 @@ qwen3-TTS-studio/
 
 This project is built on top of the excellent [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) model by Alibaba Qwen team.
 
+- **Inference engine**: [faster-qwen3-tts](https://github.com/andimarafioti/faster-qwen3-tts) — CUDA-graph accelerated Qwen3-TTS inference
 - **HuggingFace**: https://huggingface.co/collections/Qwen/qwen3-tts
 - **ModelScope**: https://modelscope.cn/collections/Qwen/Qwen3-TTS
 - **Paper**: https://arxiv.org/abs/2601.15621
