@@ -218,69 +218,106 @@ def _split_text_into_chunks(text: str) -> list[str]:
     return merged if merged else [text]
 
 
-def _check_trailing_silence(
+def _trim_trailing_silence(
     audio: np.ndarray,
     sr: int,
-    segment_sec: float = 0.5,
-    min_speech_segments: int = 2,
-    min_trailing_silent_sec: float = 2.0,
-) -> tuple[bool, float]:
+    max_keep_sec: float = 0.5,
+) -> np.ndarray:
     """
-    Detect audio truncation: speech followed by sustained trailing silence.
+    Trim trailing silence from a generated chunk, keeping up to
+    ``max_keep_sec`` of natural tail padding.
 
-    More accurate than global silent ratio - targets the specific truncation pattern
-    where audio starts normally then becomes silent due to premature EOS.
+    The fast engine can pad the end of a chunk with silence tokens (the
+    model finishes the text but keeps decoding until EOS), so chunks often
+    carry 1-20s of trailing silence. That padding is harmless audio - trim
+    it instead of failing the chunk.
 
     Args:
         audio: Audio array (float32, normalized to [-1, 1])
         sr: Sample rate
-        segment_sec: Window size for analysis (0.5s is responsive yet stable)
-        min_speech_segments: Minimum non-silent segments required at start
-        min_trailing_silent_sec: Minimum trailing silence duration to flag as truncated
+        max_keep_sec: Silence kept after the last speech frame (natural pause)
 
     Returns:
-        Tuple of (is_truncated, trailing_silence_ratio)
+        Trimmed audio array (or the original if nothing meaningful to trim).
     """
-    segment_samples = int(sr * segment_sec)
-    min_trailing_segments = int(min_trailing_silent_sec / segment_sec)
+    if audio.size == 0:
+        return audio
 
-    if len(audio) < segment_samples * (min_speech_segments + min_trailing_segments):
-        return False, 0.0
+    window = max(1, int(sr * 0.02))  # 20ms analysis windows
+    n = len(audio) // window
+    if n < 2:
+        return audio
 
-    num_segments = len(audio) // segment_samples
-    segment_rms = np.array(
-        [
-            np.sqrt(
-                np.mean(audio[i * segment_samples : (i + 1) * segment_samples] ** 2)
-            )
-            for i in range(num_segments)
-        ]
+    seg_rms = np.sqrt(
+        np.mean(audio[: n * window].reshape(n, window) ** 2, axis=1)
     )
+    p95_rms = float(np.percentile(seg_rms, 95))
+    adaptive_threshold = max(0.001, 0.02 * p95_rms)
 
-    if len(segment_rms) == 0:
-        return False, 0.0
+    # Index of the last non-silent window (0 if all silent - then keep as-is).
+    non_silent = np.nonzero(seg_rms >= adaptive_threshold)[0]
+    if non_silent.size == 0:
+        return audio
+    last_speech = int(non_silent[-1])
 
-    p95_rms = float(np.percentile(segment_rms, 95))
-    abs_floor = 0.001
-    adaptive_threshold = max(abs_floor, 0.02 * p95_rms)
+    keep_end = min(len(audio), (last_speech + 1) * window + int(sr * max_keep_sec))
+    # Never trim below a quarter second of audio.
+    if keep_end < int(sr * 0.25):
+        return audio
 
-    is_silent = segment_rms < adaptive_threshold
+    trimmed = audio[:keep_end]
+    if len(trimmed) < len(audio):
+        print(
+            f"[TTS] Trimmed {len(audio) / sr - len(trimmed) / sr:.2f}s trailing silence "
+            f"(kept {len(trimmed) / sr:.2f}s)",
+            flush=True,
+        )
+    return trimmed
 
-    speech_found = np.sum(~is_silent[:min_speech_segments]) >= min_speech_segments
-    if not speech_found:
-        return False, 0.0
 
-    trailing_silent_count = 0
-    for i in range(num_segments - 1, -1, -1):
-        if is_silent[i]:
-            trailing_silent_count += 1
-        else:
-            break
+def _check_duration_truncation(
+    audio: np.ndarray,
+    sr: int,
+    text: str,
+    label: str,
+    min_ratio: float = 0.6,
+    chars_per_sec: float = 15.0,
+) -> None:
+    """
+    Detect real premature-EOS truncation by comparing speech duration to the
+    text length.
 
-    trailing_silence_ratio = trailing_silent_count / num_segments
-    is_truncated = trailing_silent_count >= min_trailing_segments
+    A chunk is truncated only if the (silence-trimmed) audio is far shorter
+    than the text could possibly be spoken: below ``min_ratio`` of
+    ``speech_chars / chars_per_sec``. This catches early EOS that produces
+    no silence tail (the model simply stops), which a trailing-silence check
+    alone cannot see.
 
-    return is_truncated, trailing_silence_ratio
+    Args:
+        audio: Silence-trimmed audio array (float32)
+        sr: Sample rate
+        text: The chunk text that was synthesized
+        label: Human-readable context for the error message
+        min_ratio: Minimum acceptable fraction of the expected duration
+        chars_per_sec: Assumed narration rate (15 chars/s ~ 150 wpm)
+
+    Raises:
+        RuntimeError: If the audio is too short for the text.
+    """
+    speech_chars = sum(c.isalnum() for c in text)
+    if speech_chars == 0:
+        return
+
+    expected_sec = speech_chars / chars_per_sec
+    actual_sec = len(audio) / sr
+    if actual_sec < min_ratio * expected_sec:
+        raise RuntimeError(
+            f"Audio truncation detected for {label}. "
+            f"Audio is {actual_sec:.2f}s but {speech_chars} characters need "
+            f"~{expected_sec:.2f}s of speech (minimum "
+            f"{min_ratio * expected_sec:.2f}s). "
+            f"This indicates premature EOS token generation."
+        )
 
 
 def _crossfade_audio(
@@ -495,15 +532,15 @@ def _generate_preset_voice(
                 f"RMS={audio_rms:.6f}, peak={audio_peak:.6f}."
             )
 
-        is_truncated, trailing_ratio = _check_trailing_silence(audio_f, sr)
-        if is_truncated:
-            raise RuntimeError(
-                f"Audio truncation detected for preset voice {speaker}, chunk {i + 1}/{len(chunks)}. "
-                f"Trailing silence: {trailing_ratio:.1%}. "
-                f"This indicates premature EOS token generation."
-            )
+        # The fast engine may pad the chunk end with silence tokens. Trim
+        # the tail (keeping a natural pause) and only fail the chunk if the
+        # remaining speech is too short for the text (real premature EOS).
+        audio_f = _trim_trailing_silence(audio_f, sr)
+        _check_duration_truncation(
+            audio_f, sr, chunk, f"preset voice {speaker}, chunk {i + 1}/{len(chunks)}"
+        )
 
-        all_audio.append(wavs[0])
+        all_audio.append(audio_f)
 
     if len(all_audio) == 1:
         merged = all_audio[0]
@@ -614,15 +651,15 @@ def _generate_saved_voice(
                 f"RMS={audio_rms:.6f}, peak={audio_peak:.6f}."
             )
 
-        is_truncated, trailing_ratio = _check_trailing_silence(audio_f, sr)
-        if is_truncated:
-            raise RuntimeError(
-                f"Audio truncation detected for voice {voice_id}, chunk {i + 1}/{len(chunks)}. "
-                f"Trailing silence: {trailing_ratio:.1%}. "
-                f"This indicates premature EOS token generation."
-            )
+        # The fast engine may pad the chunk end with silence tokens. Trim
+        # the tail (keeping a natural pause) and only fail the chunk if the
+        # remaining speech is too short for the text (real premature EOS).
+        audio_f = _trim_trailing_silence(audio_f, sr)
+        _check_duration_truncation(
+            audio_f, sr, chunk, f"voice {voice_id}, chunk {i + 1}/{len(chunks)}"
+        )
 
-        all_audio.append(wavs[0])
+        all_audio.append(audio_f)
 
     if len(all_audio) == 1:
         merged = all_audio[0]

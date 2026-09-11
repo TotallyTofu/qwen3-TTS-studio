@@ -4564,37 +4564,38 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
                                     with gr.Accordion("LLM Provider", open=False):
                                         podcast_llm_provider = gr.Dropdown(
                                             choices=[
+                                                "Unsloth Desktop",
                                                 "OpenAI",
                                                 "Ollama",
                                                 "OpenRouter",
                                                 "Claude",
                                             ],
-                                            value="Ollama",
+                                            value="Unsloth Desktop",
                                             label="Provider",
                                             info="LLM service for script generation",
                                         )
                                         podcast_llm_model = gr.Dropdown(
                                             label="Model",
                                             choices=PROVIDER_MODEL_OPTIONS[
-                                                LLMProvider.OLLAMA
+                                                LLMProvider.UNSLOTH
                                             ],
-                                            value=DEFAULT_MODELS[LLMProvider.OLLAMA],
-                                            info="Model to use for generation (leave empty for default)",
+                                            value=DEFAULT_MODELS[LLMProvider.UNSLOTH],
+                                            info="Model for generation (Unsloth Desktop: type the model name loaded in Unsloth)",
                                             allow_custom_value=True,
                                         )
                                         podcast_llm_api_key = gr.Textbox(
                                             label="API Key",
                                             value="",
-                                            placeholder="Not required for Ollama",
+                                            placeholder="Not required for Unsloth Desktop / Ollama",
                                             type="password",
                                             visible=True,
-                                            info="API key (not needed for Ollama)",
+                                            info="API key (not needed for Unsloth Desktop or Ollama)",
                                         )
                                         podcast_llm_base_url = gr.Textbox(
                                             label="Base URL",
-                                            value="http://localhost:11434/v1",
+                                            value="http://localhost:8888/v1",
                                             placeholder="Custom API endpoint",
-                                            info="API endpoint URL",
+                                            info="API endpoint URL (Unsloth Desktop default: http://localhost:8888/v1)",
                                         )
                                         podcast_llm_status = gr.HTML(value="")
                                         podcast_llm_test_btn = gr.Button(
@@ -4875,14 +4876,25 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
                         provider_map = {
                             "OpenAI": LLMProvider.OPENAI,
                             "Ollama": LLMProvider.OLLAMA,
+                            "Unsloth Desktop": LLMProvider.UNSLOTH,
                             "OpenRouter": LLMProvider.OPENROUTER,
                             "Claude": LLMProvider.CLAUDE,
                         }
-                        provider = provider_map.get(provider_name, LLMProvider.OLLAMA)
+                        provider = provider_map.get(provider_name, LLMProvider.UNSLOTH)
                         default_model = DEFAULT_MODELS[provider]
                         model_choices = PROVIDER_MODEL_OPTIONS[provider]
 
-                        if provider == LLMProvider.OLLAMA:
+                        if provider == LLMProvider.UNSLOTH:
+                            return (
+                                gr.update(choices=model_choices, value=default_model),
+                                gr.update(
+                                    value="",
+                                    placeholder="Not required for Unsloth Desktop",
+                                ),
+                                gr.update(value="http://localhost:8888/v1"),
+                                "",
+                            )
+                        elif provider == LLMProvider.OLLAMA:
                             return (
                                 gr.update(choices=model_choices, value=default_model),
                                 gr.update(
@@ -4924,12 +4936,23 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
                         provider_map = {
                             "OpenAI": LLMProvider.OPENAI,
                             "Ollama": LLMProvider.OLLAMA,
+                            "Unsloth Desktop": LLMProvider.UNSLOTH,
                             "OpenRouter": LLMProvider.OPENROUTER,
                             "Claude": LLMProvider.CLAUDE,
                         }
-                        provider = provider_map.get(provider_name, LLMProvider.OLLAMA)
+                        provider = provider_map.get(provider_name, LLMProvider.UNSLOTH)
 
-                        if not api_key and provider != LLMProvider.OLLAMA:
+                        if provider == LLMProvider.UNSLOTH and not (model or "").strip():
+                            return (
+                                '<div style="color: #dc3545;">'
+                                "Enter the model name loaded in Unsloth Desktop "
+                                "first (the test needs it to validate the endpoint).</div>"
+                            )
+
+                        if not api_key and provider not in (
+                            LLMProvider.OLLAMA,
+                            LLMProvider.UNSLOTH,
+                        ):
                             try:
                                 from config import get_api_key_for_provider
 
@@ -5092,14 +5115,39 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
                         provider_map = {
                             "OpenAI": LLMProvider.OPENAI,
                             "Ollama": LLMProvider.OLLAMA,
+                            "Unsloth Desktop": LLMProvider.UNSLOTH,
                             "OpenRouter": LLMProvider.OPENROUTER,
                             "Claude": LLMProvider.CLAUDE,
                         }
                         llm_provider = provider_map.get(
-                            llm_provider_name, LLMProvider.OLLAMA
+                            llm_provider_name, LLMProvider.UNSLOTH
                         )
 
-                        if not llm_api_key and llm_provider != LLMProvider.OLLAMA:
+                        if llm_provider == LLMProvider.UNSLOTH and not (
+                            llm_model or ""
+                        ).strip():
+                            yield (
+                                create_step_indicator_html(GenerationStep.OUTLINE, 0.0),
+                                0,
+                                "Error: Model name required for Unsloth Desktop",
+                                "",
+                                '<div style="color: #dc3545;">Enter the model name loaded in Unsloth Desktop in the LLM Provider section.</div>',
+                                None,
+                                None,
+                                None,
+                                gr.update(visible=False),
+                                gr.update(value="Generate Podcast", interactive=True),
+                                gr.update(),
+                                gr.update(),
+                                gr.update(),
+                                gr.update(),
+                            )
+                            return
+
+                        if not llm_api_key and llm_provider not in (
+                            LLMProvider.OLLAMA,
+                            LLMProvider.UNSLOTH,
+                        ):
                             try:
                                 from config import get_api_key_for_provider
 

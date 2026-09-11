@@ -83,7 +83,7 @@ def get_api_key_for_provider(provider: str) -> str:
     Get the appropriate API key for the given provider.
 
     Args:
-        provider: The LLM provider ("openai", "ollama", "openrouter", or "claude")
+        provider: The LLM provider ("openai", "ollama", "unsloth", "openrouter", or "claude")
 
     Returns:
         str: The API key for the provider
@@ -93,6 +93,9 @@ def get_api_key_for_provider(provider: str) -> str:
     """
     if provider == "ollama":
         return "ollama"
+    elif provider == "unsloth":
+        # Local Unsloth Desktop (llama.cpp) server: no real key required.
+        return "unsloth"
     elif provider == "openai":
         return get_openai_api_key()
     elif provider == "openrouter":

@@ -1,4 +1,15 @@
+# Qwen3-TTS Studio (faster-qwen3-tts engine)
+#
+# The TTS engine is faster-qwen3-tts, which requires a CUDA GPU and a
+# CUDA-enabled PyTorch build. Install the CUDA torch build first, e.g.:
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+# (RTX 50-series / Blackwell GPUs need the cu128 wheels, PyTorch 2.7+.)
+#
+# faster-qwen3-tts is on PyPI. Pin 0.2.5 (validated with qwen-tts 0.1.1 +
+# transformers 4.x). Newer releases (0.4.0+) depend on `qwen-tts-hf` +
+# transformers 5 and must NOT be mixed with the qwen-tts install here.
 qwen-tts>=0.1.1,<0.2
+faster-qwen3-tts==0.2.5
 gradio>=4.44.0,<5.0
 pydantic>=2.0,<2.9
 soundfile

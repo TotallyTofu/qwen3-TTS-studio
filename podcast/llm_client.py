@@ -1,4 +1,4 @@
-"""Unified LLM client abstraction supporting OpenAI, Ollama, OpenRouter, and Claude."""
+"""Unified LLM client abstraction supporting OpenAI, Ollama, Unsloth Desktop, OpenRouter, and Claude."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ class LLMProvider(Enum):
 
     OPENAI = "openai"
     OLLAMA = "ollama"
+    UNSLOTH = "unsloth"
     OPENROUTER = "openrouter"
     CLAUDE = "claude"
 
@@ -21,6 +22,7 @@ class LLMProvider(Enum):
 DEFAULT_MODELS = {
     LLMProvider.OPENAI: "gpt-5.2",
     LLMProvider.OLLAMA: "qwen3:8b",
+    LLMProvider.UNSLOTH: "",
     LLMProvider.OPENROUTER: "google/gemini-2.5-flash",
     LLMProvider.CLAUDE: "claude-sonnet-4-5-20250929",
 }
@@ -28,6 +30,7 @@ DEFAULT_MODELS = {
 PROVIDER_BASE_URLS = {
     LLMProvider.OPENAI: "",
     LLMProvider.OLLAMA: "http://localhost:11434/v1",
+    LLMProvider.UNSLOTH: "http://localhost:8888/v1",
     LLMProvider.OPENROUTER: "https://openrouter.ai/api/v1",
     LLMProvider.CLAUDE: "",
 }
@@ -45,6 +48,9 @@ PROVIDER_MODEL_OPTIONS: dict[LLMProvider, list[str]] = {
         "qwen3:14b",
         "llama3.1:8b",
     ],
+    # Unsloth Desktop serves whatever GGUF model the user loaded in its UI;
+    # the model name is user-typed in the studio (allow_custom_value=True).
+    LLMProvider.UNSLOTH: [],
     LLMProvider.OPENROUTER: [
         "google/gemini-2.5-flash",
         "google/gemini-2.5-pro",
@@ -100,6 +106,10 @@ def create_llm_client(config: LLMConfig) -> Any:
     kwargs: dict[str, Any] = {}
     if config.provider == LLMProvider.OLLAMA:
         kwargs["api_key"] = "ollama"
+    elif config.provider == LLMProvider.UNSLOTH:
+        # Local Unsloth Desktop (llama.cpp) server: no real key needed, but
+        # the OpenAI client requires a non-empty value.
+        kwargs["api_key"] = config.api_key or "unsloth"
     elif config.api_key:
         kwargs["api_key"] = config.api_key
     if config.base_url:
@@ -335,6 +345,8 @@ def get_default_config(
         base_url = PROVIDER_BASE_URLS[provider]
     if provider == LLMProvider.OLLAMA and not api_key:
         api_key = "ollama"
+    if provider == LLMProvider.UNSLOTH and not api_key:
+        api_key = "unsloth"
 
     return LLMConfig(
         provider=provider,
