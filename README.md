@@ -31,7 +31,7 @@ Qwen3-TTS is a powerful text-to-speech model, but using it directly requires dea
 - **One-Click Podcasts**: Enter a topic, get a complete podcast
 - **Custom Script Input**: Write your own dialogue script instead of relying on AI generation
 - **AI Script Writing**: LLM-powered outline and transcript generation
-- **Multi-Provider LLM Support**: OpenAI, Ollama, OpenRouter, and Claude (Anthropic API)
+- **Multi-Provider LLM Support**: Unsloth Desktop (local, default), OpenAI, Ollama, OpenRouter, and Claude (Anthropic API)
 - **Multi-Speaker Support**: Assign different voices to each speaker
 - **Custom Personas**: Create and save speaker personalities
 
@@ -44,11 +44,12 @@ Qwen3-TTS is a powerful text-to-speech model, but using it directly requires dea
 
 ## Requirements
 
-- Python 3.12+
-- macOS (MPS) / Linux (CUDA)
-- 16GB+ RAM
+- Python 3.10+ (3.11 and 3.12 tested)
+- Windows or Linux with an NVIDIA CUDA GPU (the [faster-qwen3-tts](https://github.com/andimarafioti/faster-qwen3-tts) engine uses CUDA graph capture — there is no CPU/MPS mode)
+- 16GB+ RAM, 8GB+ VRAM for the 1.7B models (less for 0.6B)
 - `openai` Python package (for podcast LLM client)
 - For podcast script generation, configure one provider:
+  - Unsloth Desktop (local, default): no external API key required
   - Ollama (local): no external API key required
   - OpenAI: `OPENAI_API_KEY`
   - OpenRouter: `OPENROUTER_API_KEY`
@@ -59,31 +60,32 @@ Qwen3-TTS is a powerful text-to-speech model, but using it directly requires dea
 ### 1. Clone Repository
 
 ```bash
-git clone https://github.com/bc-dunia/qwen3-TTS-studio.git
+git clone https://github.com/TotallyTofu/qwen3-TTS-studio.git
 cd qwen3-TTS-studio
 ```
 
 ### 2. Create Virtual Environment
 
 ```bash
-conda create -n qwen3-tts python=3.12 -y
+conda create -n qwen3-tts python=3.11 -y
 conda activate qwen3-tts
 ```
 
 ### 3. Install Dependencies
 
+Install a CUDA-enabled PyTorch build first, then the studio requirements:
+
 ```bash
+# CUDA 12.8 wheels — required for RTX 50-series (Blackwell) GPUs.
+# Other GPUs: use the matching index, e.g. https://download.pytorch.org/whl/cu126
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+
 pip install -r requirements.txt
 ```
 
-For CUDA users:
-```bash
-pip install -U flash-attn --no-build-isolation
-```
-
 Notes:
-- FlashAttention is attempted automatically on CUDA when available.
-- If FlashAttention initialization fails (for example, CUDA/toolkit mismatch), the app automatically falls back to default attention.
+- The inference engine is [faster-qwen3-tts](https://github.com/andimarafioti/faster-qwen3-tts) (manual CUDA graph capture). No Flash Attention, no vLLM, no Triton — nothing extra to compile.
+- `faster-qwen3-tts` is pinned to 0.2.5 (validated with `qwen-tts` 0.1.1 + transformers 4.x). Do not upgrade to 0.4.0+ — those releases require `qwen-tts-hf` + transformers 5 and are incompatible with this setup.
 
 ### 4. Download Models
 
@@ -91,19 +93,25 @@ Download models from **HuggingFace** or **ModelScope**.
 
 #### HuggingFace (Recommended)
 
+The studio resolves models from the local HuggingFace cache, so a plain `hf download` (no `--local-dir`) is all you need:
+
 ```bash
 pip install -U huggingface_hub
 
 # Required models
-hf download Qwen/Qwen3-TTS-Tokenizer-12Hz --local-dir ./Qwen3-TTS-Tokenizer-12Hz
-hf download Qwen/Qwen3-TTS-12Hz-1.7B-Base --local-dir ./Qwen3-TTS-12Hz-1.7B-Base
-hf download Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --local-dir ./Qwen3-TTS-12Hz-1.7B-CustomVoice
+hf download Qwen/Qwen3-TTS-Tokenizer-12Hz
+hf download Qwen/Qwen3-TTS-12Hz-1.7B-Base
+hf download Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
 
 # Optional models
-hf download Qwen/Qwen3-TTS-12Hz-0.6B-Base --local-dir ./Qwen3-TTS-12Hz-0.6B-Base
-hf download Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice --local-dir ./Qwen3-TTS-12Hz-0.6B-CustomVoice
-hf download Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign --local-dir ./Qwen3-TTS-12Hz-1.7B-VoiceDesign
+hf download Qwen/Qwen3-TTS-12Hz-0.6B-Base
+hf download Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice
+hf download Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign
 ```
+
+Once cached, the studio runs fully offline — loading from a local cache snapshot skips every network probe. Set `HF_HUB_OFFLINE=1` to skip all hub checks (this is what `start_studio.bat` does).
+
+Alternatively, download to bare local directories (`hf download ... --local-dir ./Qwen3-TTS-12Hz-<name>`) and point `QWEN_TTS_MODEL_DIR` at the parent directory.
 
 #### ModelScope (For users in China)
 
@@ -115,9 +123,11 @@ modelscope download --model Qwen/Qwen3-TTS-12Hz-1.7B-Base --local_dir ./Qwen3-TT
 modelscope download --model Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --local_dir ./Qwen3-TTS-12Hz-1.7B-CustomVoice
 ```
 
+When using ModelScope local directories, set `QWEN_TTS_MODEL_DIR=.` (or the parent directory) so the studio finds them.
+
 ### 5. Environment Variables
 
-Create a `.env` file (choose based on provider):
+No API key is required for the default podcast LLM provider (Unsloth Desktop) or for Ollama. For the other providers, create a `.env` file:
 
 ```bash
 OPENAI_API_KEY=your_openai_api_key_here
@@ -126,13 +136,17 @@ ANTHROPIC_API_KEY=your_anthropic_api_key_here
 ```
 
 Notes:
+- Unsloth Desktop (default): start Unsloth Desktop with a model loaded, then set the base URL and model name in the Podcast tab under **LLM Provider** (default endpoint: `http://localhost:8888/v1`).
 - If you use Ollama, API key is not required (default local endpoint: `http://localhost:11434/v1`).
 - Claude provider uses Anthropic's official Messages API directly.
 - You can also enter provider/model/base URL/API key directly in the Podcast tab under **LLM Provider**.
 - Optional runtime env vars:
-  - `QWEN_TTS_DEVICE` to force device selection (for example: `mps`, `cuda:0`, `cpu`)
+  - `QWEN_TTS_DEVICE` to force device selection (for example: `cuda:0`, `cuda:1`)
+  - `QWEN_TTS_MODEL_DIR` to load models from bare local directories instead of the HF cache
+  - `QWEN_TTS_MAX_LOADED_MODELS` to keep more than one model resident in VRAM (default: `1`)
   - `QWEN_TTS_MIN_NEW_TOKENS` to adjust minimum generation length (default: `12`)
   - `QWEN_TTS_ALLOW_OLD=1` to bypass the minimum `qwen-tts` version gate (not recommended)
+  - `HF_HUB_OFFLINE=1` to force fully offline model resolution (recommended once models are cached)
 
 OpenRouter model options (examples in UI presets):
 - `google/gemini-2.5-flash`
@@ -145,6 +159,10 @@ OpenRouter model options (examples in UI presets):
 ## Usage
 
 ### Start Server
+
+Windows: double-click `start_studio.bat` (sets `HF_HUB_OFFLINE=1` and launches the studio).
+
+Or from a terminal:
 
 ```bash
 python qwen_tts_ui.py
@@ -164,6 +182,7 @@ Run container:
 
 ```bash
 docker run --rm -it -p 7860:7860 \
+  -e QWEN_TTS_MODEL_DIR=/app \
   -v "$(pwd)/Qwen3-TTS-Tokenizer-12Hz:/app/Qwen3-TTS-Tokenizer-12Hz" \
   -v "$(pwd)/Qwen3-TTS-12Hz-1.7B-CustomVoice:/app/Qwen3-TTS-12Hz-1.7B-CustomVoice" \
   -v "$(pwd)/Qwen3-TTS-12Hz-1.7B-Base:/app/Qwen3-TTS-12Hz-1.7B-Base" \
@@ -173,22 +192,24 @@ docker run --rm -it -p 7860:7860 \
 Then open `http://127.0.0.1:7860`.
 
 Notes:
+- For Docker, download the models to local directories first (`hf download ... --local-dir ./Qwen3-TTS-12Hz-<name>`), since the container mounts them; `QWEN_TTS_MODEL_DIR=/app` tells the studio to look there.
+- The Docker build installs the default CUDA PyTorch (cu126) from PyPI. For Blackwell (RTX 50-series) GPUs, set the torch index to `cu128` in the Dockerfile.
 - `qwen_tts_ui.py` now reads `GRADIO_SERVER_NAME` and `GRADIO_SERVER_PORT`; Docker image sets these to `0.0.0.0:7860`.
 - If you use other model variants (0.6B, VoiceDesign), mount those directories the same way.
 - Podcast features (LLM providers) are optional. If you use the Podcast tab, pass your keys via env vars or `--env-file .env`.
 - The container runs as a non-root user (`appuser`). Ensure your mounted model/tokenizer folders are readable by non-root users.
   - If you see an error about missing `speech_tokenizer/model.safetensors` and write permission, copy the tokenizer weights into the model folder on the host (or run the container with a user that can write to the bind-mounted model directory).
-- macOS note: Docker containers run Linux, so MPS acceleration is not available inside Docker (CPU only). For best performance on Mac, run natively (non-Docker).
+- GPU note: the fast engine requires an NVIDIA GPU — on Linux use the NVIDIA Container Toolkit and add `--gpus all` to `docker run`.
 - If the container exits while loading models, increase Docker Desktop memory allocation and/or use a smaller model (0.6B).
 
 #### Docker Smoke Test (Optional)
 
-This performs an end-to-end TTS run inside Docker and writes a WAV file to the host.
+This performs an end-to-end TTS run inside Docker and writes a WAV file to the host (requires an NVIDIA GPU with the NVIDIA Container Toolkit).
 
 ```bash
 mkdir -p _docker_smoke_out
 
-docker run --rm -i -e QWEN_TTS_DEVICE=cpu \
+docker run --rm -i --gpus all -e QWEN_TTS_DEVICE=cuda:0 -e QWEN_TTS_MODEL_DIR=/app \
   -v "$(pwd)/Qwen3-TTS-Tokenizer-12Hz:/app/Qwen3-TTS-Tokenizer-12Hz" \
   -v "$(pwd)/Qwen3-TTS-12Hz-0.6B-CustomVoice:/app/Qwen3-TTS-12Hz-0.6B-CustomVoice" \
   -v "$(pwd)/_docker_smoke_out:/out" \
@@ -245,32 +266,9 @@ PY
 
 You should see `SMOKE_OK` and a file at `_docker_smoke_out/docker_smoke_ryan.wav`.
 
-### Use Prebuilt Image from GHCR
+### Prebuilt Images
 
-Pull the prebuilt image from GitHub Container Registry:
-
-```bash
-docker pull ghcr.io/bc-dunia/qwen3-tts-studio:latest
-```
-
-Run the container:
-
-```bash
-docker run --rm -it -p 7860:7860 \
-  -v "$(pwd)/Qwen3-TTS-Tokenizer-12Hz:/app/Qwen3-TTS-Tokenizer-12Hz" \
-  -v "$(pwd)/Qwen3-TTS-12Hz-1.7B-CustomVoice:/app/Qwen3-TTS-12Hz-1.7B-CustomVoice" \
-  -v "$(pwd)/Qwen3-TTS-12Hz-1.7B-Base:/app/Qwen3-TTS-12Hz-1.7B-Base" \
-  ghcr.io/bc-dunia/qwen3-tts-studio:latest
-```
-
-Then open `http://127.0.0.1:7860`.
-
-Notes:
-- Models are mounted at runtime and not bundled in the image. Mount the same directories as shown above.
-- Podcast features (LLM providers) are optional. If you use the Podcast tab, pass your keys via env vars or `--env-file .env`.
-- On Apple Silicon/ARM64, if you see `no matching manifest for linux/arm64/v8`, use `--platform linux/amd64` in both `docker pull` and `docker run`.
-- For reproducible deployments, pin a release tag (for example: `ghcr.io/bc-dunia/qwen3-tts-studio:0.1.7`).
-- If you use other model variants (0.6B, VoiceDesign), mount those directories the same way.
+No prebuilt image is published for this fork — build from source as shown above (the Dockerfile picks up the faster-qwen3-tts engine via `requirements.txt`).
 
 ### Available Models
 
