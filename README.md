@@ -4,7 +4,8 @@ A professional-grade interface for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-T
 
 This model enables Qwen3-TTS Instant voice cloning, If you want a serious finetuning, use https://github.com/bc-dunia/qwen3-TTS-finetune-studio. For more information about the inference engine check out https://github.com/andimarafioti/faster-qwen3-tts
 
-![Qwen3-TTS Studio Screenshot](docs/screenshot.png)
+<img width="2149" height="937" alt="image" src="https://github.com/user-attachments/assets/1959592c-973c-423a-aac3-366cc23dfef4" />
+
 
 ## Why This Project?
 
