@@ -60,6 +60,12 @@ MIN_NEW_TOKENS_DEFAULT = int(os.environ.get("QWEN_TTS_MIN_NEW_TOKENS", "12"))
 # max_new_tokens the studio can request (estimate_max_tokens caps at 4096).
 MAX_SEQ_LEN = 4096
 
+# The fast engine replays shared CUDA graphs and static caches, so two
+# generations must never run at once. Gradio's queue serializes the UI's own
+# runs; this lock also covers callers outside it (the OpenAI-compatible API
+# server handles requests on its own threads).
+_generate_lock = threading.Lock()
+
 
 @functools.lru_cache(maxsize=1)
 def _check_qwen_tts_version() -> None:
@@ -205,7 +211,8 @@ class FasterQwen3TTSAdapter:
         for key in self._DROP_ALWAYS:
             kwargs.pop(key, None)
         kwargs.setdefault("min_new_tokens", self._min_new_tokens)
-        return getattr(self._fast, method)(**kwargs)
+        with _generate_lock:
+            return getattr(self._fast, method)(**kwargs)
 
     @staticmethod
     def _auto_language(language):

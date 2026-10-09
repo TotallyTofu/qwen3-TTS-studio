@@ -41,6 +41,7 @@ podcasts/
 saved_voices/
 personas/
 tts_settings.json
+openai_api_settings.json
 
 # Logs
 *.log

@@ -1,6 +1,7 @@
 """Podcast file storage management."""
 
 import json
+import locale
 import re
 from pathlib import Path
 
@@ -33,6 +34,22 @@ def sanitize_podcast_name(name: str) -> str:
         raise ValueError("Podcast name cannot be empty or contain only invalid characters")
     
     return sanitized
+
+
+def read_json_file(path: Path | str) -> object:
+    """
+    Read a podcast JSON artifact.
+
+    Artifacts are written as UTF-8. Older versions wrote them in the system's
+    legacy encoding (cp1252 on most Windows installs), so fall back to that
+    for files that are not valid UTF-8.
+    """
+    data = Path(path).read_bytes()
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = data.decode(locale.getpreferredencoding(False))
+    return json.loads(text)
 
 
 def create_podcast_directory(podcast_name: str) -> Path:
@@ -87,7 +104,7 @@ def save_outline(outline: Outline, podcast_dir: Path) -> Path:
     outline_path = podcast_dir / "outline.json"
     
     try:
-        _ = outline_path.write_text(outline.model_dump_json(indent=2))
+        _ = outline_path.write_text(outline.model_dump_json(indent=2), encoding="utf-8")
     except PermissionError as e:
         raise PermissionError(f"Cannot write to {outline_path}: {e}") from e
     except OSError as e:
@@ -117,7 +134,7 @@ def save_transcript(transcript: Transcript, podcast_dir: Path) -> Path:
     transcript_path = podcast_dir / "transcript.json"
     
     try:
-        _ = transcript_path.write_text(transcript.model_dump_json(indent=2))
+        _ = transcript_path.write_text(transcript.model_dump_json(indent=2), encoding="utf-8")
     except PermissionError as e:
         raise PermissionError(f"Cannot write to {transcript_path}: {e}") from e
     except OSError as e:
@@ -147,7 +164,7 @@ def save_metadata(metadata: PodcastMetadata, podcast_dir: Path) -> Path:
     metadata_path = podcast_dir / "metadata.json"
     
     try:
-        _ = metadata_path.write_text(metadata.model_dump_json(indent=2))
+        _ = metadata_path.write_text(metadata.model_dump_json(indent=2), encoding="utf-8")
     except PermissionError as e:
         raise PermissionError(f"Cannot write to {metadata_path}: {e}") from e
     except OSError as e:
@@ -212,15 +229,15 @@ def load_podcast_artifacts(podcast_name: str) -> dict[str, dict | None]:
     try:
         outline_path = podcast_dir / "outline.json"
         if outline_path.exists():
-            artifacts["outline"] = json.loads(outline_path.read_text())
+            artifacts["outline"] = read_json_file(outline_path)
         
         transcript_path = podcast_dir / "transcript.json"
         if transcript_path.exists():
-            artifacts["transcript"] = json.loads(transcript_path.read_text())
+            artifacts["transcript"] = read_json_file(transcript_path)
         
         metadata_path = podcast_dir / "metadata.json"
         if metadata_path.exists():
-            artifacts["metadata"] = json.loads(metadata_path.read_text())
+            artifacts["metadata"] = read_json_file(metadata_path)
     except json.JSONDecodeError as e:
         raise json.JSONDecodeError(
             f"Malformed JSON in podcast artifacts: {e.msg}",

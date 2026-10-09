@@ -7,7 +7,7 @@ import threading
 from contextlib import contextmanager
 from math import ceil
 from pathlib import Path
-from typing import Any, Generator
+from typing import Any, Callable, Generator
 
 import numpy as np
 import soundfile as sf
@@ -59,6 +59,7 @@ def timeout_handler(
 
 
 from podcast.models import Dialogue, SpeakerProfile, Transcript
+from podcast.presets import MODEL_SAMPLING_DEFAULTS
 
 SAVED_VOICES_DIR = Path("saved_voices")
 
@@ -158,6 +159,28 @@ CHUNK_TARGET = 120
 CHUNK_MAX = 150
 CHUNK_MIN = 50
 
+# Chunk quality checks. Qwen3-TTS can get stuck emitting silence frames
+# mid-chunk (dead air the trailing trim cannot see) or return a chunk with no
+# speech at all. Levels are 50ms-window RMS on float audio in [-1, 1].
+SILENCE_WINDOW_SEC = 0.05
+# Silence inside stuck runs measured <= 0.012 (~-38 dBFS); speech windows sit
+# far above it.
+SILENCE_ABS_THRESHOLD = 0.012
+# A chunk whose loudest 1% of windows is below this has no speech in it
+# (measured: real speech >= 0.089, failed chunks <= 0.025).
+NO_SPEECH_LEVEL = 0.04
+# Pauses at least this long are dead air, not natural phrasing.
+LONG_SILENCE_SEC = 1.5
+# Length each dead-air run is shortened to when every attempt has some.
+COMPRESSED_SILENCE_SEC = 0.5
+# Attempts per chunk before giving up (no seed is set, so retries differ).
+CHUNK_ATTEMPTS = 3
+
+# Token budget: the 12Hz codec emits 12.5 frames per second of audio.
+CODEC_FRAMES_PER_SEC = 12.5
+MAX_TOKENS_HEADROOM = 2.5
+MAX_TOKENS_PAD = 24
+
 
 def _split_text_into_chunks(text: str) -> list[str]:
     """Split long text into sentence-based chunks for TTS generation."""
@@ -218,6 +241,79 @@ def _split_text_into_chunks(text: str) -> list[str]:
     return merged if merged else [text]
 
 
+def _window_rms(audio: np.ndarray, sr: int, window_sec: float) -> tuple[np.ndarray, int]:
+    """Return per-window RMS levels and the window size in samples."""
+    window = max(1, int(sr * window_sec))
+    n = len(audio) // window
+    if n == 0:
+        return np.zeros(0, dtype=np.float32), window
+    rms = np.sqrt(np.mean(audio[: n * window].reshape(n, window) ** 2, axis=1))
+    return rms, window
+
+
+def _speech_level(window_rms: np.ndarray) -> float:
+    """Loudness of the speech in a chunk: the 99th-percentile window RMS."""
+    if window_rms.size == 0:
+        return 0.0
+    return float(np.percentile(window_rms, 99))
+
+
+def _silence_threshold(window_rms: np.ndarray) -> float:
+    """Window RMS below which audio counts as silence.
+
+    Absolute so that hissy "silence" from noisy voice references is caught,
+    but scaled down for unusually quiet voices so their speech is not.
+    """
+    return min(SILENCE_ABS_THRESHOLD, 0.1 * _speech_level(window_rms))
+
+
+def _find_long_silences(
+    audio: np.ndarray,
+    sr: int,
+    min_sec: float = LONG_SILENCE_SEC,
+) -> list[tuple[int, int]]:
+    """
+    Find leading or mid-chunk silences of at least ``min_sec``.
+
+    Returns (start, end) sample ranges. A run that reaches the end of the
+    audio is trailing silence, which _trim_trailing_silence handles.
+    """
+    rms, window = _window_rms(audio, sr, SILENCE_WINDOW_SEC)
+    if rms.size < 2:
+        return []
+
+    silent = rms < _silence_threshold(rms)
+    min_windows = int(ceil(min_sec / SILENCE_WINDOW_SEC))
+
+    runs: list[tuple[int, int]] = []
+    start = None
+    for k, is_silent in enumerate(silent):
+        if is_silent and start is None:
+            start = k
+        elif not is_silent and start is not None:
+            if k - start >= min_windows:
+                runs.append((start * window, k * window))
+            start = None
+    return runs
+
+
+def _compress_silences(
+    audio: np.ndarray,
+    sr: int,
+    silences: list[tuple[int, int]],
+    keep_sec: float = COMPRESSED_SILENCE_SEC,
+) -> np.ndarray:
+    """Shorten each silence run to ``keep_sec`` (half kept from each side)."""
+    half = int(sr * keep_sec / 2)
+    pieces = []
+    cursor = 0
+    for start, end in silences:
+        pieces.append(audio[cursor : start + half])
+        cursor = max(start + half, end - half)
+    pieces.append(audio[cursor:])
+    return np.concatenate(pieces)
+
+
 def _trim_trailing_silence(
     audio: np.ndarray,
     sr: int,
@@ -243,19 +339,12 @@ def _trim_trailing_silence(
     if audio.size == 0:
         return audio
 
-    window = max(1, int(sr * 0.02))  # 20ms analysis windows
-    n = len(audio) // window
-    if n < 2:
+    seg_rms, window = _window_rms(audio, sr, 0.02)  # 20ms analysis windows
+    if seg_rms.size < 2:
         return audio
 
-    seg_rms = np.sqrt(
-        np.mean(audio[: n * window].reshape(n, window) ** 2, axis=1)
-    )
-    p95_rms = float(np.percentile(seg_rms, 95))
-    adaptive_threshold = max(0.001, 0.02 * p95_rms)
-
     # Index of the last non-silent window (0 if all silent - then keep as-is).
-    non_silent = np.nonzero(seg_rms >= adaptive_threshold)[0]
+    non_silent = np.nonzero(seg_rms >= _silence_threshold(seg_rms))[0]
     if non_silent.size == 0:
         return audio
     last_speech = int(non_silent[-1])
@@ -339,23 +428,184 @@ def _crossfade_audio(
     return np.concatenate([audio1[:-fade_samples], crossfaded, audio2[fade_samples:]])
 
 
-def _calculate_dynamic_max_tokens(text: str, preset_max: int) -> int:
-    """Calculate dynamic max_new_tokens based on text length."""
-    MIN_TOKENS = 256
+def _is_syllabic_char(c: str) -> bool:
+    """CJK ideographs, kana and Hangul: roughly one syllable per character."""
+    code = ord(c)
+    return (
+        0x3040 <= code <= 0x30FF  # Hiragana, Katakana
+        or 0x3400 <= code <= 0x4DBF  # CJK Extension A
+        or 0x4E00 <= code <= 0x9FFF  # CJK Unified Ideographs
+        or 0xAC00 <= code <= 0xD7AF  # Hangul syllables
+    )
+
+
+def _estimate_speech_seconds(text: str) -> float:
+    """Rough spoken duration of text, erring on the slow side."""
+    seconds = 0.0
+    for c in text:
+        if _is_syllabic_char(c):
+            seconds += 0.25
+        elif c.isdigit():
+            # Digits expand when read aloud ("1,200" -> "twelve hundred").
+            seconds += 0.25
+        elif c.isalnum():
+            seconds += 1 / 15
+    return seconds
+
+
+def _calculate_dynamic_max_tokens(text: str) -> int:
+    """
+    Calculate max_new_tokens from the expected spoken length of the text.
+
+    The budget is a ceiling, not a target: the model normally stops at EOS.
+    It matters when the model gets stuck emitting silence, so keep it to a
+    few times the expected length instead of a fixed 20s+ minimum.
+    """
+    MIN_TOKENS = 48
     MAX_TOKENS = 768
 
-    char_count = len(text)
-    estimated = ceil(char_count * 2.5)
-    dynamic_max = ceil(estimated * 1.3)
+    expected_sec = _estimate_speech_seconds(text)
+    dynamic_max = ceil(expected_sec * CODEC_FRAMES_PER_SEC * MAX_TOKENS_HEADROOM) + MAX_TOKENS_PAD
 
     max_new = max(MIN_TOKENS, min(dynamic_max, MAX_TOKENS))
 
     print(
-        f"[TTS] max_tokens: chars={char_count}, dynamic={dynamic_max}, final={max_new}",
+        f"[TTS] max_tokens: chars={len(text)}, expected={expected_sec:.1f}s, final={max_new}",
         flush=True,
     )
 
     return max_new
+
+
+def _validate_chunk_audio(
+    audio_data: np.ndarray, sr: int, text: str, label: str
+) -> np.ndarray:
+    """
+    Normalize a generated chunk, trim its trailing silence, and reject chunks
+    that are empty, contain no speech, or are truncated.
+
+    Raises:
+        RuntimeError: If the chunk fails a quality check.
+    """
+    if audio_data.size == 0:
+        raise RuntimeError(f"Empty audio for {label}.")
+
+    audio_f = audio_data.astype(np.float32)
+    if np.issubdtype(audio_data.dtype, np.integer):
+        audio_f = audio_f / np.iinfo(audio_data.dtype).max
+    audio_rms = float(np.sqrt(np.mean(audio_f * audio_f)))
+    audio_peak = float(np.max(np.abs(audio_f)))
+    speech_level = _speech_level(_window_rms(audio_f, sr, SILENCE_WINDOW_SEC)[0])
+
+    print(
+        f"[TTS] {label}: RMS={audio_rms:.4f}, peak={audio_peak:.4f}, "
+        f"speech level={speech_level:.4f}",
+        flush=True,
+    )
+
+    # Peak/RMS alone miss chunks of low-level room tone, which can still
+    # contain clicks; judge by the loudest windows instead.
+    if speech_level < NO_SPEECH_LEVEL:
+        raise RuntimeError(
+            f"Silent audio for {label}. RMS={audio_rms:.6f}, peak={audio_peak:.6f}, "
+            f"speech level={speech_level:.6f}."
+        )
+
+    # The fast engine may pad the chunk end with silence tokens. Trim
+    # the tail (keeping a natural pause) and only fail the chunk if the
+    # remaining speech is too short for the text (real premature EOS).
+    audio_f = _trim_trailing_silence(audio_f, sr)
+    _check_duration_truncation(audio_f, sr, text, label)
+    return audio_f
+
+
+def _synthesize_chunk(
+    text: str,
+    generate: Callable[[str, int], tuple[Any, int]],
+    label: str,
+) -> tuple[np.ndarray, int]:
+    """
+    Generate one chunk, regenerating it when the output has no speech, is
+    truncated, or contains long dead-air pauses.
+
+    If every attempt has dead air, the attempt with the least of it is used
+    with its pauses shortened, rather than dropping the line.
+
+    Args:
+        text: Chunk text.
+        generate: Callable (text, max_new_tokens) -> (wavs, sample_rate).
+        label: Human-readable context for logs and errors.
+
+    Raises:
+        RuntimeError: If no attempt produced usable speech.
+    """
+    max_new_tokens = _calculate_dynamic_max_tokens(text)
+    error_context = f"{label}, Text length: {len(text)} chars"
+
+    best: tuple[float, np.ndarray, list[tuple[int, int]]] | None = None
+    last_error: RuntimeError | None = None
+    sr = 0
+    for attempt in range(1, CHUNK_ATTEMPTS + 1):
+        with timeout_handler(TTS_TIMEOUT_SECONDS, error_context):
+            wavs, chunk_sr = generate(text, max_new_tokens)
+        sr = int(chunk_sr)
+
+        try:
+            audio = _validate_chunk_audio(wavs[0], sr, text, label)
+        except RuntimeError as e:
+            last_error = e
+            print(f"[TTS] {e} (attempt {attempt}/{CHUNK_ATTEMPTS})", flush=True)
+            continue
+
+        silences = _find_long_silences(audio, sr)
+        if not silences:
+            return audio, sr
+
+        silent_sec = sum(end - start for start, end in silences) / sr
+        print(
+            f"[TTS] {label}: {silent_sec:.1f}s of dead air in {len(silences)} "
+            f"pause(s) (attempt {attempt}/{CHUNK_ATTEMPTS})",
+            flush=True,
+        )
+        if best is None or silent_sec < best[0]:
+            best = (silent_sec, audio, silences)
+
+    if best is not None:
+        silent_sec, audio, silences = best
+        print(
+            f"[TTS] {label}: every attempt had dead air; shortening "
+            f"{len(silences)} pause(s) totalling {silent_sec:.1f}s",
+            flush=True,
+        )
+        return _compress_silences(audio, sr, silences), sr
+
+    raise last_error or RuntimeError(f"No audio generated for {label}.")
+
+
+def _synthesize_text(
+    text: str,
+    generate: Callable[[str, int], tuple[Any, int]],
+    label: str,
+) -> tuple[list[np.ndarray], int]:
+    """Split text into chunks, synthesize each, and crossfade them together."""
+    chunks = _split_text_into_chunks(text)
+
+    if len(chunks) > 1:
+        print(f"[TTS] Splitting text into {len(chunks)} chunks for {label}", flush=True)
+
+    all_audio: list[np.ndarray] = []
+    sr = 0
+    for i, chunk in enumerate(chunks):
+        audio, sr = _synthesize_chunk(chunk, generate, f"{label}, chunk {i + 1}/{len(chunks)}")
+        all_audio.append(audio)
+
+    merged = all_audio[0]
+    for audio in all_audio[1:]:
+        merged = _crossfade_audio(merged, audio, sr)
+    if len(all_audio) > 1:
+        print(f"[TTS] Merged {len(all_audio)} chunks into single audio", flush=True)
+
+    return [merged], sr
 
 
 def generate_dialogue_audio(
@@ -410,18 +660,9 @@ def generate_dialogue_audio(
             f"Invalid voice type: {speaker.type}. Must be 'preset' or 'saved'."
         )
 
-    base_model_name = params.get("model_name", "1.7B-CustomVoice")
-
-    if speaker.type == "saved":
-        voice_meta_path = SAVED_VOICES_DIR / speaker.voice_id / "metadata.json"
-        if voice_meta_path.exists():
-            with open(voice_meta_path) as f:
-                voice_meta = json.load(f)
-                model_name = voice_meta.get("model", "1.7B-Base")
-        else:
-            model_name = base_model_name.replace("CustomVoice", "Base")
-    else:
-        model_name = base_model_name
+    model_name = _resolve_voice_model(
+        speaker.type, speaker.voice_id, params.get("model_name", "1.7B-CustomVoice")
+    )
 
     try:
         from audio.model_loader import get_model
@@ -454,6 +695,68 @@ def generate_dialogue_audio(
     return str(output_path)
 
 
+def _resolve_voice_model(voice_type: str, voice_id: str, base_model_name: str) -> str:
+    """Model that renders a voice: saved voices use the model they were cloned with."""
+    if voice_type != "saved":
+        return base_model_name
+    voice_meta_path = SAVED_VOICES_DIR / voice_id / "metadata.json"
+    if voice_meta_path.exists():
+        with open(voice_meta_path) as f:
+            return json.load(f).get("model", "1.7B-Base")
+    return base_model_name.replace("CustomVoice", "Base")
+
+
+def synthesize_speech(
+    text: str, voice_type: str, voice_id: str, params: dict[str, Any]
+) -> tuple[np.ndarray, int]:
+    """
+    Synthesize text with a preset or saved voice.
+
+    Uses the same chunking, retry, and dead-air handling as podcast clips.
+
+    Args:
+        text: Text to synthesize (any length; split into chunks internally).
+        voice_type: "preset" or "saved".
+        voice_id: Preset speaker name or saved voice directory name.
+        params: TTS parameters (see generate_dialogue_audio).
+
+    Returns:
+        Tuple of (float32 mono audio, sample_rate).
+    """
+    if voice_type not in ("preset", "saved"):
+        raise ValueError(f"Invalid voice type: {voice_type}. Must be 'preset' or 'saved'.")
+
+    from audio.model_loader import get_model
+
+    model_name = _resolve_voice_model(
+        voice_type, voice_id, params.get("model_name", "1.7B-CustomVoice")
+    )
+    model = get_model(model_name)
+    if voice_type == "preset":
+        wavs, sr = _generate_preset_voice(model, text, voice_id, params)
+    else:
+        wavs, sr = _generate_saved_voice(model, text, voice_id, params)
+    return wavs[0], sr
+
+
+def _sampling_kwargs(params: dict[str, Any]) -> dict[str, Any]:
+    """Sampling arguments shared by every generate call."""
+    defaults = MODEL_SAMPLING_DEFAULTS
+    return {
+        "temperature": params.get("temperature", defaults["temperature"]),
+        "top_k": int(params.get("top_k", defaults["top_k"])),
+        "top_p": params.get("top_p", defaults["top_p"]),
+        "repetition_penalty": params.get(
+            "repetition_penalty", defaults["repetition_penalty"]
+        ),
+        "subtalker_temperature": params.get(
+            "subtalker_temperature", defaults["subtalker_temperature"]
+        ),
+        "subtalker_top_k": int(params.get("subtalker_top_k", defaults["subtalker_top_k"])),
+        "subtalker_top_p": params.get("subtalker_top_p", defaults["subtalker_top_p"]),
+    }
+
+
 def _generate_preset_voice(
     model: Any, text: str, speaker: str, params: dict[str, Any]
 ) -> tuple[Any, int]:
@@ -472,85 +775,20 @@ def _generate_preset_voice(
     lang = _normalize_language(params.get("language", "english"))
     print(f"[LANG] TTS normalized: {lang}", flush=True)
 
-    # Split long text into chunks to avoid timeouts
-    chunks = _split_text_into_chunks(text)
+    sampling = _sampling_kwargs(params)
 
-    if len(chunks) > 1:
-        print(
-            f"[TTS] Splitting text into {len(chunks)} chunks for speaker {speaker}",
-            flush=True,
+    def generate(chunk: str, max_new_tokens: int) -> tuple[Any, int]:
+        return model.generate_custom_voice(
+            text=chunk,
+            speaker=speaker,
+            language=lang,
+            instruct=params.get("instruct"),
+            non_streaming_mode=True,
+            max_new_tokens=max_new_tokens,
+            **sampling,
         )
 
-    all_audio: list[np.ndarray] = []
-    sr: int = 0
-
-    for i, chunk in enumerate(chunks):
-        preset_max = int(params.get("max_new_tokens", 1024))
-        dynamic_max = _calculate_dynamic_max_tokens(chunk, preset_max)
-
-        error_context = f"Speaker: {speaker}, Chunk {i + 1}/{len(chunks)}, Text length: {len(chunk)} chars"
-        with timeout_handler(TTS_TIMEOUT_SECONDS, error_context):
-            wavs, chunk_sr = model.generate_custom_voice(
-                text=chunk,
-                speaker=speaker,
-                language=lang,
-                instruct=params.get("instruct"),
-                non_streaming_mode=True,
-                temperature=params.get("temperature", 0.3),
-                top_k=int(params.get("top_k", 50)),
-                top_p=params.get("top_p", 0.85),
-                repetition_penalty=params.get("repetition_penalty", 1.0),
-                max_new_tokens=dynamic_max,
-                subtalker_temperature=params.get("subtalker_temperature", 0.3),
-                subtalker_top_k=int(params.get("subtalker_top_k", 50)),
-                subtalker_top_p=params.get("subtalker_top_p", 0.85),
-            )
-
-        if sr == 0:
-            sr = int(chunk_sr)
-
-        audio_data = wavs[0]
-        if audio_data.size == 0:
-            raise RuntimeError(
-                f"Empty audio for preset voice {speaker}, chunk {i + 1}/{len(chunks)}"
-            )
-
-        audio_f = audio_data.astype(np.float32)
-        if np.issubdtype(audio_data.dtype, np.integer):
-            audio_f = audio_f / np.iinfo(audio_data.dtype).max
-        audio_rms = float(np.sqrt(np.mean(audio_f * audio_f)))
-        audio_peak = float(np.max(np.abs(audio_f)))
-
-        print(
-            f"[TTS] Preset chunk {i + 1}/{len(chunks)}: RMS={audio_rms:.4f}, peak={audio_peak:.4f}",
-            flush=True,
-        )
-
-        if audio_peak < 0.003 or audio_rms < 0.001:
-            raise RuntimeError(
-                f"Silent audio for preset voice {speaker}, chunk {i + 1}/{len(chunks)}. "
-                f"RMS={audio_rms:.6f}, peak={audio_peak:.6f}."
-            )
-
-        # The fast engine may pad the chunk end with silence tokens. Trim
-        # the tail (keeping a natural pause) and only fail the chunk if the
-        # remaining speech is too short for the text (real premature EOS).
-        audio_f = _trim_trailing_silence(audio_f, sr)
-        _check_duration_truncation(
-            audio_f, sr, chunk, f"preset voice {speaker}, chunk {i + 1}/{len(chunks)}"
-        )
-
-        all_audio.append(audio_f)
-
-    if len(all_audio) == 1:
-        merged = all_audio[0]
-    else:
-        merged = all_audio[0]
-        for audio in all_audio[1:]:
-            merged = _crossfade_audio(merged, audio, sr)
-        print(f"[TTS] Merged {len(all_audio)} chunks into single audio", flush=True)
-
-    return [merged], sr
+    return _synthesize_text(text, generate, f"preset voice {speaker}")
 
 
 def _generate_saved_voice(
@@ -573,13 +811,9 @@ def _generate_saved_voice(
     """
     voice_dir = SAVED_VOICES_DIR / voice_id
     prompt_path = voice_dir / "prompt.pkl"
-    meta_path = voice_dir / "metadata.json"
 
     if not prompt_path.exists():
         raise FileNotFoundError(f"Saved voice not found: {voice_id}")
-
-    with open(meta_path) as f:
-        meta = json.load(f)
 
     with open(prompt_path, "rb") as f:
         raw_prompt = pickle.load(f)
@@ -593,83 +827,19 @@ def _generate_saved_voice(
     lang = _normalize_language(params.get("language", "english"))
     print(f"[LANG] TTS normalized (voice clone): {lang}", flush=True)
 
-    chunks = _split_text_into_chunks(text)
+    sampling = _sampling_kwargs(params)
 
-    if len(chunks) > 1:
-        print(
-            f"[TTS] Splitting text into {len(chunks)} chunks for voice {voice_id}",
-            flush=True,
+    def generate(chunk: str, max_new_tokens: int) -> tuple[Any, int]:
+        return model.generate_voice_clone(
+            text=chunk,
+            language=lang,
+            voice_clone_prompt=voice_clone_prompt,
+            non_streaming_mode=True,
+            max_new_tokens=max_new_tokens,
+            **sampling,
         )
 
-    all_audio: list[np.ndarray] = []
-    sr: int = 0
-
-    for i, chunk in enumerate(chunks):
-        preset_max = int(params.get("max_new_tokens", 1024))
-        dynamic_max = _calculate_dynamic_max_tokens(chunk, preset_max)
-
-        error_context = f"Voice: {voice_id}, Chunk {i + 1}/{len(chunks)}, Text length: {len(chunk)} chars"
-        with timeout_handler(TTS_TIMEOUT_SECONDS, error_context):
-            wavs, chunk_sr = model.generate_voice_clone(
-                text=chunk,
-                language=lang,
-                voice_clone_prompt=voice_clone_prompt,
-                non_streaming_mode=True,
-                temperature=params.get("temperature", 0.3),
-                top_k=int(params.get("top_k", 50)),
-                top_p=params.get("top_p", 0.85),
-                repetition_penalty=params.get("repetition_penalty", 1.0),
-                max_new_tokens=dynamic_max,
-                subtalker_temperature=params.get("subtalker_temperature", 0.3),
-                subtalker_top_k=int(params.get("subtalker_top_k", 50)),
-                subtalker_top_p=params.get("subtalker_top_p", 0.85),
-            )
-
-        if sr == 0:
-            sr = int(chunk_sr)
-
-        audio_data = wavs[0]
-        if audio_data.size == 0:
-            raise RuntimeError(
-                f"Empty audio returned for voice {voice_id}, chunk {i + 1}/{len(chunks)}"
-            )
-
-        audio_f = audio_data.astype(np.float32)
-        if np.issubdtype(audio_data.dtype, np.integer):
-            audio_f = audio_f / np.iinfo(audio_data.dtype).max
-        audio_rms = float(np.sqrt(np.mean(audio_f * audio_f)))
-        audio_peak = float(np.max(np.abs(audio_f)))
-
-        print(
-            f"[TTS] Voice clone chunk {i + 1}/{len(chunks)}: RMS={audio_rms:.4f}, peak={audio_peak:.4f}",
-            flush=True,
-        )
-
-        if audio_peak < 0.003 or audio_rms < 0.001:
-            raise RuntimeError(
-                f"Silent audio detected for voice {voice_id}, chunk {i + 1}/{len(chunks)}. "
-                f"RMS={audio_rms:.6f}, peak={audio_peak:.6f}."
-            )
-
-        # The fast engine may pad the chunk end with silence tokens. Trim
-        # the tail (keeping a natural pause) and only fail the chunk if the
-        # remaining speech is too short for the text (real premature EOS).
-        audio_f = _trim_trailing_silence(audio_f, sr)
-        _check_duration_truncation(
-            audio_f, sr, chunk, f"voice {voice_id}, chunk {i + 1}/{len(chunks)}"
-        )
-
-        all_audio.append(audio_f)
-
-    if len(all_audio) == 1:
-        merged = all_audio[0]
-    else:
-        merged = all_audio[0]
-        for audio in all_audio[1:]:
-            merged = _crossfade_audio(merged, audio, sr)
-        print(f"[TTS] Merged {len(all_audio)} chunks into single audio", flush=True)
-
-    return [merged], sr
+    return _synthesize_text(text, generate, f"voice {voice_id}")
 
 
 def generate_transcript_audio(

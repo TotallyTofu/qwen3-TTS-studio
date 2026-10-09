@@ -105,12 +105,15 @@ def create_step_indicator_html(
         GenerationStep.COMBINE: "Combine",
     }
     
+    # The last step at 100% means the whole pipeline is done: show every step as completed.
+    finished = current_idx == len(steps) - 1 and step_progress >= 1.0
+    
     html_parts = ['<div class="step-indicator">']
     
     for i, step in enumerate(steps):
         label = step_labels[step]
         
-        if i < current_idx:
+        if i < current_idx or finished:
             # Completed step
             icon = '<span class="step-icon completed">&#10003;</span>'
             state_class = "completed"
@@ -133,7 +136,7 @@ def create_step_indicator_html(
         
         # Add connector between steps (except after last)
         if i < len(steps) - 1:
-            connector_class = "completed" if i < current_idx else "pending"
+            connector_class = "completed" if i < current_idx or finished else "pending"
             html_parts.append(f'<div class="step-connector {connector_class}"></div>')
     
     html_parts.append('</div>')

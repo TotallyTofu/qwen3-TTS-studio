@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Callable, cast
 
 from podcast import outline as outline_generator
+from podcast import presets as podcast_presets
 from podcast import transcript as transcript_generator
 from podcast.llm_client import LLMConfig
 from audio import batch as batch_processor
@@ -67,31 +68,14 @@ def _resolve_tts_params(quality_preset: object, language: str = "en") -> dict[st
     language = _normalize_language_code(language)
     defaults: dict[str, object] = {
         "model_name": "1.7B-CustomVoice",
-        "temperature": 0.3,
-        "top_k": 50,
-        "top_p": 0.85,
-        "repetition_penalty": 1.0,
-        "max_new_tokens": 1024,
-        "subtalker_temperature": 0.3,
-        "subtalker_top_k": 50,
-        "subtalker_top_p": 0.85,
+        **podcast_presets.get_tts_params("standard"),
         "language": language,
         "instruct": None,
     }
-    presets = {
-         # UI names
-         "quick": {"temperature": 0.5, "top_p": 0.9, "max_new_tokens": 768},
-         "standard": {},
-         "premium": {"temperature": 0.2, "top_p": 0.8, "max_new_tokens": 1400},
-         # Legacy names (backwards compatibility)
-         "draft": {"temperature": 0.5, "top_p": 0.9, "max_new_tokens": 768},
-         "high": {"temperature": 0.2, "top_p": 0.8, "max_new_tokens": 1400},
-     }
     if isinstance(quality_preset, dict):
         return {**defaults, **quality_preset}
     if isinstance(quality_preset, str):
-        preset = presets.get(quality_preset.strip().lower(), {})
-        return {**defaults, **preset}
+        return {**defaults, **podcast_presets.get_tts_params(quality_preset)}
     return defaults
 
 
@@ -102,6 +86,21 @@ def _notify(
 ) -> None:
     if callback is not None:
         callback(step, detail)
+
+
+def _record_clip_failure(
+    failed_clips: list[dict[str, object]], segment_info: dict[str, object]
+) -> None:
+    """Remember a skipped clip so it is reported instead of silently missing."""
+    if segment_info.get("status") == "error":
+        failed_clips.append(
+            {
+                "index": segment_info.get("index"),
+                "speaker": segment_info.get("speaker"),
+                "text": segment_info.get("text"),
+                "error": segment_info.get("error"),
+            }
+        )
 
 
 def _load_personas_for_speakers(speaker_profile: SpeakerProfile) -> dict[str, Persona]:
@@ -120,7 +119,7 @@ def generate_podcast(
     quality_preset: str | dict[str, object] | None,
     progress_callback: ProgressCallback | None = None,
     llm_config: LLMConfig | None = None,
-) -> dict[str, str]:
+) -> dict[str, object]:
     """
     Orchestrate full podcast generation workflow.
 
@@ -131,7 +130,8 @@ def generate_podcast(
         progress_callback: Optional callback(step_name, detail) invoked at each step.
 
     Returns:
-        Dict with paths to artifacts generated during the workflow.
+        Dict with paths to artifacts generated during the workflow, plus
+        ``failed_clips``: dialogue lines that could not be generated.
     """
     topic = str(content_input.get("topic", "")).strip()
     if not topic:
@@ -209,12 +209,14 @@ def generate_podcast(
         )
 
         _notify(progress_callback, "generate_clips", {"status": "started"})
+        failed_clips: list[dict[str, object]] = []
 
         def clip_progress(
             current: int,
             total: int,
             segment_info: dict[str, object],
         ) -> None:
+            _record_clip_failure(failed_clips, segment_info)
             clip_status = "clip_started" if segment_info.get("status") == "started" else "progress"
             _notify(
                 progress_callback,
@@ -266,6 +268,7 @@ def generate_podcast(
              "llm_model": llm_config.model if llm_config else "default",
              "created_at": started_at.isoformat(),
              "completed_at": finished_at.isoformat(),
+             "failed_clips": failed_clips,
          }
         metadata_path = podcast_dir / "metadata.json"
         _ = metadata_path.write_text(json.dumps(metadata, indent=2))
@@ -282,6 +285,7 @@ def generate_podcast(
             "clips_dir": str(clips_dir),
             "combined_audio_path": str(combined_audio_path),
             "metadata_path": str(metadata_path),
+            "failed_clips": failed_clips,
         }
     except Exception as exc:
         _notify(
@@ -370,28 +374,54 @@ def generate_audio_only(
     quality_preset: str | dict[str, object] | None = "standard",
     language: str = "en",
     progress_callback: ProgressCallback | None = None,
-) -> tuple[list[Path], Path]:
+) -> tuple[list[Path], Path, list[dict[str, object]]]:
+    """
+    Regenerate all clips for an edited transcript and recombine them.
+
+    Returns:
+        (clip paths, combined audio path, failed clips).
+    """
     tts_params = _resolve_tts_params(quality_preset, language)
     clips_dir = podcast_dir / "clips"
-    clips_dir.mkdir(parents=True, exist_ok=True)
-    
+    # Generate into a fresh staging dir and swap it in afterwards. Writing
+    # over the old clips/ would let stale clips stand in for lines that
+    # failed or were deleted in the edit.
+    staging_dir = podcast_dir / "clips_regen"
+    old_clips_dir = podcast_dir / "clips_old"
+    shutil.rmtree(staging_dir, ignore_errors=True)
+    shutil.rmtree(old_clips_dir, ignore_errors=True)
+    staging_dir.mkdir(parents=True)
+
     _notify(progress_callback, "generate_clips", {"status": "started"})
-    
+    failed_clips: list[dict[str, object]] = []
+
     def clip_progress(current: int, total: int, segment_info: dict[str, object]) -> None:
+        _record_clip_failure(failed_clips, segment_info)
         _notify(
             progress_callback,
             "generate_clips",
             {"status": "progress", "current": current, "total": total, "segment": segment_info},
         )
-    
-    clip_paths = batch_processor.generate_all_clips(
-        transcript=transcript,
-        speaker_profile=speaker_profile,
-        params=cast(dict[str, object], tts_params),
-        clips_dir=clips_dir,
-        progress_callback=clip_progress,
-    )
-    
+
+    try:
+        clip_paths = batch_processor.generate_all_clips(
+            transcript=transcript,
+            speaker_profile=speaker_profile,
+            params=cast(dict[str, object], tts_params),
+            clips_dir=staging_dir,
+            progress_callback=clip_progress,
+        )
+    except Exception:
+        # Leave the previous clips untouched.
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
+
+    if clips_dir.exists():
+        clips_dir.rename(old_clips_dir)
+    staging_dir.rename(clips_dir)
+    shutil.rmtree(old_clips_dir, ignore_errors=True)
+    clip_paths = [str(clips_dir / Path(p).name) for p in clip_paths]
+
     _notify(progress_callback, "generate_clips", {"status": "completed", "clip_count": len(clip_paths)})
     
     _notify(progress_callback, "combine_audio", {"status": "started"})
@@ -402,8 +432,8 @@ def generate_audio_only(
     )
     
     _notify(progress_callback, "combine_audio", {"status": "completed", "output_path": str(combined_audio_path)})
-    
-    return [Path(p) for p in clip_paths], Path(combined_audio_path)
+
+    return [Path(p) for p in clip_paths], Path(combined_audio_path), failed_clips
 
 
 def create_podcast_directory() -> Path:
@@ -452,7 +482,7 @@ def generate_podcast_from_script(
     language: str = "English",
     title: str = "",
     progress_callback: ProgressCallback | None = None,
-) -> dict[str, str]:
+) -> dict[str, object]:
     """
     Generate a podcast from a user-provided script (no LLM involved).
 
@@ -469,7 +499,8 @@ def generate_podcast_from_script(
         progress_callback: Optional progress callback.
 
     Returns:
-        Dict with paths to artifacts generated during the workflow.
+        Dict with paths to artifacts generated during the workflow, plus
+        ``failed_clips``: dialogue lines that could not be generated.
     """
     if not dialogues:
         raise ValueError("No dialogue lines provided.")
@@ -513,12 +544,14 @@ def generate_podcast_from_script(
         clips_dir.mkdir(parents=True, exist_ok=True)
 
         _notify(progress_callback, "generate_clips", {"status": "started"})
+        failed_clips: list[dict[str, object]] = []
 
         def clip_progress(
             current: int,
             total: int,
             segment_info: dict[str, object],
         ) -> None:
+            _record_clip_failure(failed_clips, segment_info)
             clip_status = (
                 "clip_started"
                 if segment_info.get("status") == "started"
@@ -585,6 +618,7 @@ def generate_podcast_from_script(
             "dialogue_count": len(dialogues),
             "created_at": started_at.isoformat(),
             "completed_at": finished_at.isoformat(),
+            "failed_clips": failed_clips,
         }
         metadata_path = podcast_dir / "metadata.json"
         _ = metadata_path.write_text(json.dumps(metadata, indent=2))
@@ -600,6 +634,7 @@ def generate_podcast_from_script(
             "clips_dir": str(clips_dir),
             "combined_audio_path": str(combined_audio_path),
             "metadata_path": str(metadata_path),
+            "failed_clips": failed_clips,
         }
     except Exception as exc:
         _notify(

@@ -15,7 +15,12 @@ rem set QWEN_TTS_DEVICE=cuda:1
 rem Load two models at once (doubles VRAM usage):
 rem set QWEN_TTS_MAX_LOADED_MODELS=2
 
-python qwen_tts_ui.py
+rem Use the project's virtual environment if it exists, so the launcher
+rem does not depend on whatever "python" happens to be on PATH.
+set "PYTHON=python"
+if exist ".venv\Scripts\python.exe" set "PYTHON=.venv\Scripts\python.exe"
+
+"%PYTHON%" qwen_tts_ui.py
 
 echo.
 echo Studio exited (code %errorlevel%).

@@ -35,6 +35,10 @@ Qwen3-TTS is a powerful text-to-speech model, but using it directly requires dea
 - **Multi-Speaker Support**: Assign different voices to each speaker
 - **Custom Personas**: Create and save speaker personalities
 
+### OpenAI-Compatible API
+- **Use your voices in other apps**: Link up to 4 saved voices, personas, or presets to OpenAI voice names (`alloy`, `echo`, `sage`, ...) and serve them over an OpenAI-compatible `/v1/audio/speech` endpoint
+- Works with any app or chat tool that supports OpenAI text-to-speech (see [OpenAI API Tab](#openai-api-tab))
+
 ### Quality of Life
 - **Parameter Presets**: Quick presets for different use cases
 - **Unified History Tab**: Browse, search, and replay all past generations in one place
@@ -170,6 +174,40 @@ python qwen_tts_ui.py
 
 Open `http://127.0.0.1:7860` in your browser.
 
+### OpenAI API Tab
+
+The **OpenAI API** tab runs an OpenAI-compatible text-to-speech server next to the studio, so other apps can speak with your voices.
+
+1. Link up to 4 studio voices (saved voices, personas, or presets) to OpenAI voice names such as `alloy`, `echo`, or `sage`, then click **Save Settings**.
+2. Click **Start Server** (default `http://127.0.0.1:7880/v1`). Tick *Start the API server when the studio launches* to have it start automatically.
+3. In your app, choose OpenAI as the TTS provider, set the base URL to the server URL, and pick a linked voice name.
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:7880/v1", api_key="not-needed")
+with client.audio.speech.with_streaming_response.create(
+    model="tts-1", voice="alloy", input="Hello from Qwen3-TTS Studio!"
+) as response:
+    response.stream_to_file("speech.mp3")
+```
+
+| Request field | Support |
+|---------------|---------|
+| `voice` | Any linked OpenAI voice name (case-insensitive) |
+| `input` | Up to 4096 characters; long text is split into chunks |
+| `model` | Any value is accepted (`tts-1`, `tts-1-hd`, `gpt-4o-mini-tts`, ...) |
+| `response_format` | `mp3` (default), `opus`, `aac`, `flac`, `wav`, `pcm` (24kHz 16-bit) |
+| `speed` | 0.25-4.0, applied with ffmpeg time-stretching (pitch preserved) |
+| `instructions` | Passed as the style instruction for preset voices; ignored for cloned voices |
+
+Also served: `GET /v1/models`, plus `GET /v1/audio/voices` and `/v1/audio/models` for apps that list voices (e.g. Open WebUI). Paths work with or without the `/v1` prefix.
+
+- **API key**: optional. When set, requests must send `Authorization: Bearer <key>`; otherwise any key is accepted.
+- **Network access**: the server listens on `127.0.0.1` (this PC only) by default. Set the host to `0.0.0.0` to allow other devices on your network, and set an API key when you do.
+- **Model switching**: preset voices run on the CustomVoice model and cloned voices on the Base model. Only one model stays loaded by default, so alternating between the two kinds reloads the model each time. Set `QWEN_TTS_MAX_LOADED_MODELS=2` to keep both loaded (uses about twice the VRAM).
+- Links and the API key are stored in `openai_api_settings.json` and take effect immediately; host and port changes need a server restart.
+
 ### Run with Docker
 
 Build image:
@@ -297,6 +335,9 @@ No prebuilt image is published for this fork — build from source as shown abov
 qwen3-TTS-studio/
 ├── qwen_tts_ui.py              # Main entry point
 ├── config.py                   # Configuration
+│
+├── api/                        # OpenAI-compatible API
+│   └── openai_server.py        # /v1/audio/speech server + voice links
 │
 ├── ui/                         # UI Components
 │   ├── content_input.py        # Content input section

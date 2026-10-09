@@ -18,6 +18,7 @@ import time
 import copy
 import gc
 import queue
+import re
 import threading
 import traceback
 import html as html_escape
@@ -28,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from podcast import orchestrator as podcast_orchestrator
+from podcast.presets import PODCAST_QUALITY_PRESETS
 from podcast.script_parser import parse_script
 from ui.content_input import (
     get_content_components,
@@ -58,6 +60,7 @@ from ui.draft_preview import (
     get_segment_dialogues,
     DRAFT_PREVIEW_CSS,
 )
+from ui.theme import APP_CSS, APP_JS, HEADER_HTML, build_theme
 from storage.persona_models import (
     ALLOWED_PERSONALITIES,
     ALLOWED_SPEAKING_STYLES,
@@ -66,6 +69,21 @@ from storage.persona_models import (
 from storage.persona import delete_persona, list_personas, load_persona, save_persona
 from podcast.models import Outline, Transcript, SpeakerProfile
 from storage.voice import get_available_voices, get_saved_voices, create_speaker_profile
+from storage.history import read_json_file
+from api.openai_server import (
+    MAX_LINKS as API_MAX_LINKS,
+    MAX_SPEED as API_MAX_SPEED,
+    MIN_SPEED as API_MIN_SPEED,
+    OPENAI_VOICES,
+    api_server,
+    change_speed,
+    client_base_url,
+    find_link,
+    load_api_settings,
+    save_api_settings,
+    synthesize_link,
+    voice_display_name,
+)
 from config import get_openai_api_key
 from podcast.llm_client import (
     LLMConfig,
@@ -147,200 +165,6 @@ HISTORY_DIR.mkdir(exist_ok=True)
 SETTINGS_FILE = Path("tts_settings.json")
 FAVORITES_FILE = Path("favorites.json")
 
-PERSONA_CSS = """
-.persona-cards-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-    gap: 1rem;
-    padding: 1rem 0;
-}
-.persona-card {
-    position: relative;
-    background: #14141f;
-    border: 1px solid #2a2a40;
-    border-radius: 12px;
-    padding: 1.25rem;
-    cursor: pointer;
-    transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
-    overflow: hidden;
-}
-.persona-card:hover {
-    background: #1a1a2e;
-    border-color: #3a3a55;
-    transform: translateY(-2px);
-}
-.persona-card-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: flex-start;
-    margin-bottom: 0.75rem;
-}
-.persona-name {
-    font-size: 1.1rem;
-    font-weight: 600;
-    color: #f0f0f5;
-    letter-spacing: -0.01em;
-}
-.persona-voice-badge {
-    font-size: 0.65rem;
-    font-weight: 600;
-    padding: 0.25rem 0.5rem;
-    border-radius: 6px;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    background: rgba(80, 80, 255, 0.15);
-    color: #8080ff;
-    border: 1px solid rgba(80, 80, 255, 0.3);
-}
-.persona-traits {
-    display: flex;
-    gap: 0.5rem;
-    flex-wrap: wrap;
-    margin-bottom: 0.5rem;
-}
-.persona-trait {
-    font-size: 0.75rem;
-    padding: 0.2rem 0.5rem;
-    border-radius: 4px;
-    background: rgba(255, 255, 255, 0.05);
-    color: #8888a0;
-}
-.persona-bio {
-    font-size: 0.8rem;
-    color: #555570;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    display: -webkit-box;
-    -webkit-line-clamp: 2;
-    -webkit-box-orient: vertical;
-}
-.persona-gallery-empty {
-    padding: 2rem;
-    text-align: center;
-    color: #555570;
-    border: 1px dashed #2a2a40;
-    border-radius: 12px;
-}
-"""
-
-MULTISAMPLE_CSS = """
-.sample-list-container {
-    background: #0d0d14;
-    border: 1px solid #2a2a40;
-    border-radius: 12px;
-    padding: 1rem;
-    margin-bottom: 1rem;
-}
-.sample-item {
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-    padding: 0.75rem;
-    background: #14141f;
-    border: 1px solid #2a2a40;
-    border-radius: 8px;
-    margin-bottom: 0.5rem;
-    transition: all 0.2s ease;
-}
-.sample-item:hover {
-    background: #1a1a2e;
-    border-color: #3a3a55;
-}
-.sample-item.primary {
-    border-color: #5050ff;
-    background: rgba(80, 80, 255, 0.08);
-}
-.sample-info {
-    flex: 1;
-    min-width: 0;
-}
-.sample-name {
-    font-weight: 500;
-    color: #f0f0f5;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-.sample-meta {
-    font-size: 0.8rem;
-    color: #8888a0;
-    display: flex;
-    gap: 0.75rem;
-    margin-top: 0.25rem;
-}
-.sample-badge {
-    font-size: 0.65rem;
-    font-weight: 600;
-    padding: 0.2rem 0.5rem;
-    border-radius: 4px;
-    text-transform: uppercase;
-}
-.sample-badge.primary {
-    background: rgba(80, 80, 255, 0.2);
-    color: #8080ff;
-}
-.sample-badge.good {
-    background: rgba(80, 200, 120, 0.2);
-    color: #50c878;
-}
-.sample-badge.warning {
-    background: rgba(255, 180, 50, 0.2);
-    color: #ffb432;
-}
-.sample-total {
-    padding: 0.75rem;
-    background: #1a1a2e;
-    border-radius: 8px;
-    margin-top: 0.5rem;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-}
-.sample-total-label {
-    color: #8888a0;
-    font-size: 0.9rem;
-}
-.sample-total-value {
-    color: #f0f0f5;
-    font-weight: 600;
-}
-.sample-warnings {
-    margin-top: 0.75rem;
-    padding: 0.75rem;
-    background: rgba(255, 180, 50, 0.1);
-    border: 1px solid rgba(255, 180, 50, 0.3);
-    border-radius: 8px;
-    font-size: 0.85rem;
-    color: #ffb432;
-}
-.sample-recommendations {
-    margin-top: 0.5rem;
-    padding: 0.5rem 0.75rem;
-    background: rgba(80, 80, 255, 0.1);
-    border-radius: 6px;
-    font-size: 0.8rem;
-    color: #8080ff;
-}
-.combine-toggle {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    padding: 0.75rem;
-    background: #14141f;
-    border: 1px solid #2a2a40;
-    border-radius: 8px;
-    margin-top: 0.75rem;
-}
-.combine-toggle-label {
-    font-size: 0.9rem;
-    color: #f0f0f5;
-}
-.combine-toggle-desc {
-    font-size: 0.8rem;
-    color: #8888a0;
-}
-"""
-
 from audio.model_loader import MODEL_PATHS, get_model, loaded_models, _gpu_cleanup
 from audio.embedding_utils import (
     AudioSampleInfo,
@@ -397,48 +221,6 @@ PARAM_TOOLTIPS = {
     "subtalker_temperature": "Voice rhythm/accent control. Default recommended, adjust if needed",
     "subtalker_top_k": "Intonation diversity control. Default recommended",
     "subtalker_top_p": "Intonation selection range. Default recommended",
-}
-
-PODCAST_QUALITY_PRESETS = {
-    "quick": {
-        "num_segments": 2,
-        "temperature": 0.7,
-        "top_k": 30,
-        "top_p": 0.9,
-        "repetition_penalty": 1.0,
-        "max_new_tokens": 768,
-        "subtalker_temperature": 0.7,
-        "subtalker_top_k": 30,
-        "subtalker_top_p": 0.9,
-        "duration_estimate": "2-3 min",
-        "tooltip": "Fast generation with 2-3 segments. Best for quick demos and testing. ~2-3 minutes total.",
-    },
-    "standard": {
-        "num_segments": 4,
-        "temperature": 0.9,
-        "top_k": 50,
-        "top_p": 1.0,
-        "repetition_penalty": 1.05,
-        "max_new_tokens": 1024,
-        "subtalker_temperature": 0.9,
-        "subtalker_top_k": 50,
-        "subtalker_top_p": 1.0,
-        "duration_estimate": "5-7 min",
-        "tooltip": "Balanced quality and speed with 4-5 segments. Recommended for most podcasts. ~5-7 minutes total.",
-    },
-    "premium": {
-        "num_segments": 6,
-        "temperature": 1.0,
-        "top_k": 80,
-        "top_p": 1.0,
-        "repetition_penalty": 1.1,
-        "max_new_tokens": 1400,
-        "subtalker_temperature": 1.0,
-        "subtalker_top_k": 80,
-        "subtalker_top_p": 1.0,
-        "duration_estimate": "10-15 min",
-        "tooltip": "High quality with 6-8 segments. Best for professional podcasts. ~10-15 minutes total.",
-    },
 }
 
 MAX_CHARS = 2000
@@ -767,25 +549,57 @@ def _format_elapsed(seconds: float) -> str:
     return f"{hours}h {mins}m"
 
 
+def _podcast_completion_status(
+    failed_clips: list[dict] | None, success_text: str, success_html: str
+) -> tuple[str, str]:
+    """Status text and HTML for a finished podcast, warning about missing lines."""
+    if not failed_clips:
+        return success_text, success_html
+    lines = ", ".join(
+        f"#{int(clip.get('index', 0)) + 1} {clip.get('speaker', '')}"
+        for clip in failed_clips
+    )
+    text = (
+        f"Podcast generated, but {len(failed_clips)} line(s) failed and are "
+        f"missing from the audio: {lines}. Edit them and use 'Regenerate Audio "
+        f"from Edits' to retry."
+    )
+    return text, f'<div style="color: #b8860b;">{html_escape.escape(text)}</div>'
+
+
+_SPEAKER_TAG_RE = re.compile(r"\[([^\]\n]{1,40})\]")
+_TRANSCRIPT_PREVIEW_LIMIT = 100
+
+
 def _render_podcast_transcript_html(transcript_data: dict) -> str:
     """Render transcript data as styled HTML for podcast preview."""
     dialogues = transcript_data.get("dialogues", [])
     if not dialogues:
         return '<div class="empty-state">No dialogues</div>'
+    speaker_index: dict[str, int] = {}
     html_parts = []
-    for dlg in dialogues[:20]:
-        speaker = html_escape.escape(dlg.get("speaker", "Speaker"))
-        text = html_escape.escape(dlg.get("text", ""))
-        html_parts.append(
-            f'<div style="margin-bottom: 0.5rem; padding: 0.5rem; background: #f8f9fa; border-radius: 4px;">'
-            f"<strong>{speaker}:</strong> {text}"
-            f"</div>"
+    for dlg in dialogues[:_TRANSCRIPT_PREVIEW_LIMIT]:
+        name = str(dlg.get("speaker", "Speaker"))
+        color = speaker_index.setdefault(name, len(speaker_index) % 4)
+        initial = html_escape.escape(
+            "".join(w[0] for w in name.split()[:2]).upper() or "?"
         )
-    if len(dialogues) > 20:
-        html_parts.append(
-            f'<div style="color: #666; text-align: center;">... and {len(dialogues) - 20} more lines</div>'
+        speaker = html_escape.escape(name)
+        # Delivery cues such as [laughs] / [excited] become small chips.
+        text = _SPEAKER_TAG_RE.sub(
+            r'<span class="dlg-tag">\1</span>',
+            html_escape.escape(str(dlg.get("text", ""))),
         )
-    return "".join(html_parts)
+        html_parts.append(
+            f'<div class="dlg s{color}"><div class="dlg-avatar">{initial}</div>'
+            f'<div><div class="dlg-speaker">{speaker}</div>'
+            f'<div class="dlg-text">{text}</div></div></div>'
+        )
+    if len(dialogues) > _TRANSCRIPT_PREVIEW_LIMIT:
+        html_parts.append(
+            f'<div class="dlg-more">... and {len(dialogues) - _TRANSCRIPT_PREVIEW_LIMIT} more lines</div>'
+        )
+    return f'<div class="dlg-list">{"".join(html_parts)}</div>'
 
 
 def save_to_history(
@@ -872,11 +686,9 @@ def get_history_items(
                         outline_path = podcast_dir / "outline.json"
                         transcript_path = podcast_dir / "transcript.json"
                         if outline_path.exists():
-                            with open(outline_path) as f:
-                                meta["outline"] = json.load(f)
+                            meta["outline"] = read_json_file(outline_path)
                         if transcript_path.exists():
-                            with open(transcript_path) as f:
-                                meta["transcript"] = json.load(f)
+                            meta["transcript"] = read_json_file(transcript_path)
 
                         if search_query:
                             search_lower = search_query.lower()
@@ -2487,7 +2299,7 @@ def update_podcast_preset_info(preset_name):
         return gr.update(value="Unknown preset")
     p = PODCAST_QUALITY_PRESETS[preset_name]
     return gr.update(
-        value=f'<div style="font-size:0.8rem;color:var(--gray-600);padding:0.5rem;background:var(--gray-100);border-radius:4px;">{p["tooltip"]}</div>'
+        value=f'<div class="hint">{p["tooltip"]}</div>'
     )
 
 
@@ -2575,992 +2387,7 @@ LANGUAGES = [
     "spanish",
 ]
 
-custom_css = """
-/* ===== MONOTONE MINIMAL DESIGN ===== */
-:root {
-    --gray-50: #f8f9fa;
-    --gray-100: #f1f3f5;
-    --gray-200: #e9ecef;
-    --gray-300: #dee2e6;
-    --gray-400: #ced4da;
-    --gray-500: #6c757d;
-    --gray-600: #5a6268;
-    --gray-700: #495057;
-    --gray-800: #343a40;
-    --gray-900: #212529;
-    --white: #ffffff;
-    --radius: 4px;
-}
-
-/* Hide Gradio footer and settings */
-footer { display: none !important; }
-.gradio-container > .wrap > .contain > footer { display: none !important; }
-.settings-btn, [class*="settings"] { display: none !important; }
-.built-with { display: none !important; }
-
-.gradio-container {
-    max-width: 1400px !important;
-    margin: 0 auto;
-    background: var(--gray-50) !important;
-}
-
-/* ===== HEADER ===== */
-.main-header {
-    text-align: center;
-    padding: 1.25rem 0;
-    margin-bottom: 1rem;
-    border-bottom: 1px solid var(--gray-200);
-}
-
-.main-title {
-    font-size: 1.5rem;
-    font-weight: 600;
-    color: var(--gray-800);
-    margin: 0;
-    letter-spacing: -0.01em;
-}
-
-.sub-title {
-    color: var(--gray-600);
-    font-size: 0.875rem;
-    margin: 0.25rem 0 0;
-}
-
-/* ===== SECTION HEADERS ===== */
-.section-header {
-    font-size: 0.75rem;
-    font-weight: 600;
-    color: var(--gray-600);
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    margin-bottom: 0.75rem;
-    padding-bottom: 0.5rem;
-    border-bottom: 1px solid var(--gray-200);
-}
-
-/* ===== INFO TEXT ===== */
-.prose.info-text {
-    font-size: 0.8rem;
-    color: var(--gray-500);
-}
-
-.prose.info-text * {
-    color: inherit;
-}
-
-.prose.info-text p {
-    line-height: 1.4;
-}
-
-.info-text :is(p, ul) {
-    margin: 0 0 0.5rem;
-}
-
-.info-text ul {
-    padding-left: 1rem;
-}
-
-.info-text li {
-    margin: 0.15rem 0;
-}
-
-.info-text :is(p, ul):last-child {
-    margin-bottom: 0;
-}
-
-/* ===== PARAMETERS PANEL ===== */
-.params-panel {
-    background: var(--white);
-    border: 1px solid var(--gray-200);
-    border-radius: var(--radius);
-    padding: 1rem;
-}
-
-.panel-header-compact {
-    font-size: 0.8rem;
-    font-weight: 600;
-    color: var(--gray-800);
-    margin-bottom: 0.75rem;
-    padding-bottom: 0.5rem;
-    border-bottom: 1px solid var(--gray-300);
-}
-
-/* ===== SAVE INDICATOR ===== */
-.save-indicator {
-    display: inline-block;
-    font-size: 0.75rem;
-    color: var(--gray-600);
-    opacity: 0;
-    transition: opacity 0.3s ease;
-    padding: 0.25rem 0.5rem;
-    background: var(--gray-100);
-    border-radius: var(--radius);
-}
-
-.save-indicator.show {
-    opacity: 1;
-    animation: fadeInOut 3s ease;
-}
-
-.param-changed {
-    animation: highlight-change 1s ease;
-}
-
-@keyframes fadeInOut {
-    0% { opacity: 0; }
-    10% { opacity: 1; }
-    80% { opacity: 1; }
-    100% { opacity: 0; }
-}
-
-@keyframes highlight-change {
-    0% { background: rgba(100, 100, 200, 0.2); }
-    100% { background: transparent; }
-}
-
-/* ===== PRESET BUTTONS ===== */
-.preset-btn-group {
-    display: flex;
-    gap: 0.5rem;
-    margin-bottom: 0.75rem;
-}
-
-.preset-section {
-    background: var(--gray-100);
-    border: 1px solid var(--gray-200);
-    border-radius: var(--radius);
-    padding: 0.75rem;
-    margin-bottom: 0.75rem;
-}
-
-.preset-btn-lg {
-    padding: 0.5rem 0.75rem !important;
-    font-size: 0.8rem !important;
-    font-weight: 500 !important;
-    border-radius: var(--radius) !important;
-    background: var(--white) !important;
-    border: 1px solid var(--gray-300) !important;
-    color: var(--gray-700) !important;
-}
-
-.preset-btn-lg:hover {
-    background: var(--gray-100) !important;
-    border-color: var(--gray-400) !important;
-}
-
-.preset-btn-fast, .preset-btn-quality {
-    border-color: var(--gray-300) !important;
-}
-
-/* ===== CHARACTER COUNTER ===== */
-.char-count {
-    font-size: 0.75rem;
-    color: var(--gray-600);
-    padding: 0.25rem 0.5rem;
-    background: var(--gray-100);
-    border-radius: var(--radius);
-    display: inline-block;
-}
-
-.char-count.char-warning {
-    color: var(--gray-700);
-    background: var(--gray-200);
-}
-
-.char-count.char-error {
-    color: var(--gray-800);
-    background: var(--gray-300);
-    font-weight: 500;
-}
-
-/* ===== GENERATE BUTTON ===== */
-.generate-btn {
-    min-height: 44px !important;
-    font-size: 0.9rem !important;
-    font-weight: 500 !important;
-    border-radius: var(--radius) !important;
-    background: var(--gray-800) !important;
-    border: none !important;
-    color: var(--white) !important;
-}
-
-.generate-btn:hover {
-    background: var(--gray-900) !important;
-}
-
-/* ===== HISTORY SECTION ===== */
-.history-section {
-    margin-top: 1.5rem;
-    padding-top: 1rem;
-    border-top: 1px solid var(--gray-200);
-}
-
-.history-header {
-    font-size: 0.75rem;
-    font-weight: 600;
-    color: var(--gray-700);
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    margin-bottom: 0.75rem;
-}
-
-.history-list {
-    max-height: 300px;
-    overflow-y: auto;
-}
-
-/* ===== HISTORY ITEMS (Clickable Buttons) ===== */
-.history-item-btn {
-    width: 100%;
-    text-align: left !important;
-    padding: 0.625rem 0.75rem !important;
-    margin-bottom: 0.375rem !important;
-    background: var(--white) !important;
-    border: 1px solid var(--gray-200) !important;
-    border-radius: var(--radius) !important;
-    font-size: 0.8rem !important;
-    color: var(--gray-800) !important;
-    cursor: pointer !important;
-    transition: background 0.15s ease !important;
-}
-
-.history-item-btn:hover {
-    background: var(--gray-100) !important;
-    border-color: var(--gray-300) !important;
-}
-
-.history-item-btn .item-text {
-    display: block;
-    font-weight: 400;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-
-.history-item-btn .item-meta {
-    font-size: 0.7rem;
-    color: var(--gray-500);
-    margin-top: 0.25rem;
-}
-
-/* ===== EMPTY STATE ===== */
-.empty-state {
-    text-align: center;
-    padding: 1.5rem;
-    color: var(--gray-600);
-    font-size: 0.8rem;
-}
-
-/* ===== TABS ===== */
-.tab-nav button {
-    font-weight: 500 !important;
-    padding: 0.625rem 1rem !important;
-    font-size: 0.85rem !important;
-}
-
-/* ===== ACCORDION ===== */
-.gradio-accordion {
-    border: 1px solid var(--gray-200) !important;
-    border-radius: var(--radius) !important;
-    margin-bottom: 0.5rem !important;
-    overflow: hidden;
-}
-
-.gradio-accordion > .label-wrap {
-    background: var(--gray-50) !important;
-    padding: 0.5rem 0.75rem !important;
-    font-size: 0.8rem !important;
-    font-weight: 500 !important;
-    border-bottom: 1px solid var(--gray-200) !important;
-}
-
-.gradio-accordion > .label-wrap:hover {
-    background: var(--gray-100) !important;
-}
-
-.gradio-accordion > .wrap {
-    padding: 0.75rem !important;
-    background: var(--white) !important;
-}
-
-/* ===== COMPACT PARAMS ===== */
-.compact-params-panel {
-    font-size: 0.85rem;
-}
-
-.compact-params-panel .wrap {
-    gap: 0.25rem !important;
-}
-
-.compact-params-panel input[type="range"] {
-    height: 4px !important;
-}
-
-.compact-params-panel label span {
-    font-size: 0.8rem !important;
-    color: var(--gray-700) !important;
-}
-
-.compact-params-panel .info {
-    font-size: 0.7rem !important;
-    line-height: 1.3 !important;
-    color: var(--gray-500) !important;
-    margin-top: 2px !important;
-}
-
-.compact-slider-row {
-    gap: 0.375rem !important;
-}
-
-.compact-slider-row > div {
-    min-width: 0 !important;
-}
-
-/* ===== MINI BUTTONS ===== */
-.mini-btn-row button {
-    padding: 0.375rem 0.5rem !important;
-    font-size: 0.75rem !important;
-    min-height: 28px !important;
-    background: var(--white) !important;
-    border: 1px solid var(--gray-300) !important;
-    color: var(--gray-700) !important;
-}
-
-.mini-btn-row button:hover {
-    background: var(--gray-100) !important;
-}
-
-/* ===== RESPONSIVE ===== */
-@media (max-width: 768px) {
-    .main-title { font-size: 1.25rem; }
-    .preset-btn-group { flex-direction: column; }
-}
-
-/* ===== HIDE VISUAL NOISE ===== */
-.section-header-icon { display: none; }
-
-/* ========================================================================
-   PODCAST TAB - PREMIUM ELEVATED DESIGN
-   ======================================================================== */
-
-/* ===== PODCAST TAB CONTAINER ===== */
-.podcast-tab {
-    background: linear-gradient(135deg, var(--gray-50) 0%, #f0f4f8 50%, var(--gray-100) 100%);
-    border-radius: 12px;
-    padding: 1.5rem;
-    position: relative;
-    overflow: hidden;
-}
-
-.podcast-tab::before {
-    content: '';
-    position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    height: 3px;
-    background: linear-gradient(90deg, var(--gray-400), var(--gray-600), var(--gray-400));
-}
-
-/* ===== PODCAST SECTION HEADERS WITH ICONS ===== */
-.podcast-section-header {
-    display: flex;
-    align-items: center;
-    gap: 0.625rem;
-    font-size: 0.875rem;
-    font-weight: 600;
-    color: var(--gray-800);
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    margin-bottom: 1rem;
-    padding-bottom: 0.625rem;
-    border-bottom: 2px solid var(--gray-200);
-}
-
-.podcast-section-header .section-icon {
-    font-size: 1.125rem;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    background: var(--gray-100);
-    border-radius: 6px;
-}
-
-/* Specific section header styles */
-.podcast-section-content .section-icon { background: linear-gradient(135deg, #f8f9fa, #e9ecef); }
-.podcast-section-voices .section-icon { background: linear-gradient(135deg, #f1f3f5, #dee2e6); }
-.podcast-section-draft .section-icon { background: linear-gradient(135deg, #e9ecef, #ced4da); }
-.podcast-section-generate .section-icon { background: linear-gradient(135deg, #e9ecef, #ced4da); }
-.podcast-section-output .section-icon { background: linear-gradient(135deg, #f1f3f5, #e9ecef); }
-
-/* ===== VOICE CARDS ===== */
-.voice-card-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-    gap: 1rem;
-}
-
-.voice-card {
-    background: var(--white);
-    border: 1px solid var(--gray-200);
-    border-radius: 10px;
-    padding: 1rem;
-    cursor: pointer;
-    transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
-    position: relative;
-    overflow: hidden;
-}
-
-.voice-card::before {
-    content: '';
-    position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    height: 3px;
-    background: var(--gray-300);
-    transition: background 0.25s ease;
-}
-
-.voice-card:hover {
-    border-color: var(--gray-400);
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08), 0 2px 8px rgba(0, 0, 0, 0.04);
-    transform: translateY(-2px);
-}
-
-.voice-card:hover::before {
-    background: var(--gray-600);
-}
-
-.voice-card.selected {
-    border-color: var(--gray-600);
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
-}
-
-.voice-card.selected::before {
-    background: var(--gray-800);
-}
-
-.voice-card-name {
-    font-weight: 600;
-    font-size: 0.9rem;
-    color: var(--gray-800);
-    margin-bottom: 0.375rem;
-}
-
-.voice-card-meta {
-    font-size: 0.75rem;
-    color: var(--gray-500);
-}
-
-/* Voice Card Role Indicators */
-.voice-card-role {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.25rem;
-    padding: 0.25rem 0.5rem;
-    border-radius: 4px;
-    font-size: 0.7rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
-    margin-top: 0.5rem;
-}
-
-.voice-card-role.host {
-    background: var(--gray-800);
-    color: var(--white);
-}
-
-.voice-card-role.guest {
-    background: var(--gray-200);
-    color: var(--gray-700);
-}
-
-.voice-card-role.narrator {
-    background: var(--gray-100);
-    color: var(--gray-600);
-    border: 1px solid var(--gray-300);
-}
-
-/* ===== DRAFT PREVIEW WITH TREE INDENTATION ===== */
-.draft-preview-container {
-    background: var(--white);
-    border: 1px solid var(--gray-200);
-    border-radius: 10px;
-    padding: 1.25rem;
-    max-height: 500px;
-    overflow-y: auto;
-}
-
-.draft-segment {
-    position: relative;
-    padding-left: 1.5rem;
-    margin-bottom: 1rem;
-}
-
-.draft-segment::before {
-    content: '';
-    position: absolute;
-    left: 0;
-    top: 0;
-    bottom: 0;
-    width: 2px;
-    background: var(--gray-200);
-    border-radius: 1px;
-}
-
-.draft-segment:last-child::before {
-    height: 1rem;
-}
-
-.draft-segment-title {
-    font-weight: 600;
-    font-size: 0.85rem;
-    color: var(--gray-800);
-    margin-bottom: 0.5rem;
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-}
-
-.draft-segment-title::before {
-    content: '';
-    width: 8px;
-    height: 8px;
-    background: var(--gray-400);
-    border-radius: 50%;
-    margin-left: -1.75rem;
-}
-
-/* Dialogue Items */
-.draft-dialogue {
-    padding: 0.75rem;
-    margin-bottom: 0.5rem;
-    background: var(--gray-50);
-    border-radius: 8px;
-    border-left: 3px solid transparent;
-    transition: all 0.2s ease;
-}
-
-.draft-dialogue:hover {
-    background: var(--gray-100);
-}
-
-.draft-dialogue.host {
-    border-left-color: var(--gray-800);
-}
-
-.draft-dialogue.guest {
-    border-left-color: var(--gray-500);
-}
-
-.draft-dialogue.narrator {
-    border-left-color: var(--gray-400);
-    font-style: italic;
-}
-
-/* Speaker Badges */
-.speaker-badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.25rem;
-    padding: 0.2rem 0.5rem;
-    border-radius: 4px;
-    font-size: 0.7rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.02em;
-    margin-bottom: 0.375rem;
-}
-
-.speaker-badge.host {
-    background: var(--gray-800);
-    color: var(--white);
-}
-
-.speaker-badge.guest {
-    background: var(--gray-200);
-    color: var(--gray-700);
-}
-
-.speaker-badge.narrator {
-    background: transparent;
-    color: var(--gray-500);
-    border: 1px solid var(--gray-300);
-}
-
-.dialogue-text {
-    font-size: 0.85rem;
-    color: var(--gray-700);
-    line-height: 1.5;
-}
-
-/* ===== PROGRESS BAR WITH SMOOTH ANIMATIONS ===== */
-.podcast-progress-container {
-    background: var(--white);
-    border: 1px solid var(--gray-200);
-    border-radius: 10px;
-    padding: 1.25rem;
-    margin-bottom: 1rem;
-}
-
-.podcast-progress-bar {
-    height: 6px;
-    background: var(--gray-200);
-    border-radius: 3px;
-    overflow: hidden;
-    margin-bottom: 1rem;
-}
-
-.podcast-progress-fill {
-    height: 100%;
-    background: linear-gradient(90deg, var(--gray-500), var(--gray-700));
-    border-radius: 3px;
-    transition: width 0.6s cubic-bezier(0.4, 0, 0.2, 1);
-    position: relative;
-}
-
-.podcast-progress-fill::after {
-    content: '';
-    position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    background: linear-gradient(
-        90deg,
-        transparent 0%,
-        rgba(255, 255, 255, 0.3) 50%,
-        transparent 100%
-    );
-    animation: progress-shimmer 2s infinite;
-}
-
-@keyframes progress-shimmer {
-    0% { transform: translateX(-100%); }
-    100% { transform: translateX(100%); }
-}
-
-/* Progress Steps */
-.podcast-progress-steps {
-    display: flex;
-    justify-content: space-between;
-    gap: 0.5rem;
-}
-
-.podcast-step {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    flex: 1;
-    text-align: center;
-}
-
-.podcast-step-indicator {
-    width: 32px;
-    height: 32px;
-    border-radius: 50%;
-    background: var(--gray-100);
-    border: 2px solid var(--gray-300);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 0.875rem;
-    margin-bottom: 0.5rem;
-    transition: all 0.3s ease;
-}
-
-.podcast-step.pending .podcast-step-indicator {
-    background: var(--gray-100);
-    border-color: var(--gray-300);
-    color: var(--gray-500);
-}
-
-.podcast-step.active .podcast-step-indicator {
-    background: var(--gray-200);
-    border-color: var(--gray-600);
-    color: var(--gray-800);
-    animation: pulse-step 1.5s infinite;
-}
-
-@keyframes pulse-step {
-    0%, 100% { box-shadow: 0 0 0 0 rgba(73, 80, 87, 0.4); }
-    50% { box-shadow: 0 0 0 8px rgba(73, 80, 87, 0); }
-}
-
-.podcast-step.completed .podcast-step-indicator {
-    background: var(--gray-700);
-    border-color: var(--gray-700);
-    color: var(--white);
-}
-
-.podcast-step.completed .podcast-step-indicator::after {
-    content: '✓';
-    font-weight: bold;
-}
-
-.podcast-step-label {
-    font-size: 0.7rem;
-    font-weight: 500;
-    color: var(--gray-600);
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
-}
-
-.podcast-step.active .podcast-step-label {
-    color: var(--gray-800);
-    font-weight: 600;
-}
-
-.podcast-step.completed .podcast-step-label {
-    color: var(--gray-700);
-}
-
-/* ===== OUTPUT SECTION ===== */
-.podcast-output-card {
-    background: linear-gradient(135deg, var(--gray-100), var(--white));
-    border: 1px solid var(--gray-200);
-    border-radius: 10px;
-    padding: 1.25rem;
-    transition: all 0.3s ease;
-}
-
-.podcast-output-card:hover {
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.06);
-}
-
-.podcast-audio-player {
-    background: var(--gray-800);
-    border-radius: 8px;
-    padding: 1rem;
-    margin-top: 0.75rem;
-}
-
-.podcast-audio-player audio {
-    width: 100%;
-}
-
-/* ===== HOVER STATES FOR INTERACTIVE ELEMENTS ===== */
-.podcast-tab button:not(.generate-btn) {
-    transition: all 0.2s ease;
-}
-
-.podcast-tab button:not(.generate-btn):hover {
-    background: var(--gray-100) !important;
-    border-color: var(--gray-400) !important;
-}
-
-.podcast-tab input:focus,
-.podcast-tab textarea:focus,
-.podcast-tab select:focus {
-    border-color: var(--gray-500) !important;
-    box-shadow: 0 0 0 3px rgba(73, 80, 87, 0.1) !important;
-    outline: none !important;
-}
-
-.podcast-tab .generate-btn {
-    background: linear-gradient(135deg, var(--gray-800), var(--gray-900)) !important;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
-    transition: all 0.3s ease;
-}
-
-.podcast-tab .generate-btn:hover {
-    transform: translateY(-1px);
-    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.2);
-}
-
-.podcast-tab .generate-btn:active {
-    transform: translateY(0);
-}
-
-/* ===== RESPONSIVE DESIGN FOR 1024px+ SCREENS ===== */
-@media (min-width: 1024px) {
-    .podcast-tab {
-        padding: 2rem;
-    }
-    
-    .voice-card-grid {
-        grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-        gap: 1.25rem;
-    }
-    
-    .voice-card {
-        padding: 1.25rem;
-    }
-    
-    .draft-preview-container {
-        max-height: 600px;
-    }
-    
-    .podcast-progress-steps {
-        gap: 1rem;
-    }
-    
-    .podcast-step-indicator {
-        width: 40px;
-        height: 40px;
-        font-size: 1rem;
-    }
-    
-    .podcast-step-label {
-        font-size: 0.75rem;
-    }
-    
-    .podcast-section-header {
-        font-size: 0.9rem;
-    }
-    
-    .podcast-section-header .section-icon {
-        width: 32px;
-        height: 32px;
-        font-size: 1.25rem;
-    }
-}
-
-@media (min-width: 1280px) {
-    .voice-card-grid {
-        grid-template-columns: repeat(4, 1fr);
-    }
-    
-    .podcast-tab {
-        padding: 2.5rem;
-    }
-}
-
-/* ===== PODCAST TAB SPECIFIC OVERRIDES ===== */
-.podcast-tab .gradio-accordion {
-    border-radius: 10px !important;
-    border-color: var(--gray-200) !important;
-}
-
-.podcast-tab .gradio-accordion > .label-wrap {
-    padding: 0.75rem 1rem !important;
-    font-size: 0.85rem !important;
-}
-
-.podcast-tab .gradio-accordion > .wrap {
-    padding: 1rem !important;
-}
-
-/* ===== PODCAST LOADING STATES ===== */
-.podcast-loading-skeleton {
-    background: linear-gradient(
-        90deg,
-        var(--gray-100) 25%,
-        var(--gray-200) 50%,
-        var(--gray-100) 75%
-    );
-    background-size: 200% 100%;
-    animation: skeleton-shimmer 1.5s infinite;
-    border-radius: 6px;
-}
-
-@keyframes skeleton-shimmer {
-    0% { background-position: -200% 0; }
-    100% { background-position: 200% 0; }
-}
-
-/* ===== PODCAST CONTENT INPUT ENHANCEMENTS ===== */
-.podcast-topic-input {
-    background: var(--white);
-    border: 2px solid var(--gray-200);
-    border-radius: 10px;
-    transition: border-color 0.2s ease;
-}
-
-.podcast-topic-input:focus-within {
-    border-color: var(--gray-500);
-}
-
-.podcast-keypoints-list {
-    list-style: none;
-    padding: 0;
-    margin: 0;
-}
-
-.podcast-keypoint-item {
-    display: flex;
-    align-items: flex-start;
-    gap: 0.75rem;
-    padding: 0.75rem;
-    background: var(--gray-50);
-    border-radius: 8px;
-    margin-bottom: 0.5rem;
-    transition: background 0.2s ease;
-}
-
-.podcast-keypoint-item:hover {
-    background: var(--gray-100);
-}
-
-.podcast-keypoint-number {
-    width: 24px;
-    height: 24px;
-    background: var(--gray-200);
-    border-radius: 50%;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 0.75rem;
-    font-weight: 600;
-    color: var(--gray-700);
-    flex-shrink: 0;
-}
-
-/* ===== PODCAST TAB NAVIGATION HIGHLIGHT ===== */
-.tab-nav button[aria-selected="true"].podcast-tab-btn {
-    background: linear-gradient(180deg, var(--white), var(--gray-50)) !important;
-    border-bottom: 2px solid var(--gray-700) !important;
-    color: var(--gray-900) !important;
-    font-weight: 600 !important;
-}
-
-/* ===== PODCAST EMPTY STATES ===== */
-.podcast-empty-state {
-    text-align: center;
-    padding: 3rem 2rem;
-    background: var(--gray-50);
-    border: 2px dashed var(--gray-300);
-    border-radius: 12px;
-}
-
-.podcast-empty-state-icon {
-    font-size: 2.5rem;
-    margin-bottom: 1rem;
-    opacity: 0.5;
-}
-
-.podcast-empty-state-text {
-    font-size: 0.9rem;
-    color: var(--gray-600);
-    max-width: 300px;
-    margin: 0 auto;
-    line-height: 1.5;
-}
-
-/* ===== PODCAST SUCCESS ANIMATIONS ===== */
-.podcast-success-checkmark {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 48px;
-    height: 48px;
-    background: var(--gray-800);
-    border-radius: 50%;
-    color: var(--white);
-    font-size: 1.5rem;
-    animation: checkmark-pop 0.4s cubic-bezier(0.4, 0, 0.2, 1);
-}
-
-@keyframes checkmark-pop {
-    0% { transform: scale(0); }
-    50% { transform: scale(1.2); }
-    100% { transform: scale(1); }
-}
-"""
+custom_css = APP_CSS
 
 settings = load_settings()
 
@@ -3705,20 +2532,270 @@ def _generate_persona_voice_preview(voice_id: str, voice_type: str) -> str | Non
         return None
 
 
-with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
-    gr.HTML("""
-    <div class="main-header">
-        <h1 class="main-title">Qwen3-TTS Studio</h1>
-        <p class="sub-title">Voice Cloning & Text-to-Speech</p>
-    </div>
-    """)
+# ---------------------------------------------------------------------------
+# OpenAI API tab
+# ---------------------------------------------------------------------------
+
+# OpenAI voice names suggested for empty link slots, in order.
+_API_DEFAULT_NAMES = ("alloy", "echo", "sage", "nova")
+
+
+def _get_api_voice_choices() -> list[tuple[str, str]]:
+    """Studio voices for API links; voices with a persona show its name first."""
+    persona_names = {
+        f"{voice_type}:{voice_id}": persona.character_name
+        for voice_id, voice_type, persona in list_personas()
+    }
+    choices = [("-- Not linked --", "")]
+    for label, value in _get_podcast_voice_choices():
+        if not value:
+            continue
+        if value in persona_names:
+            label = f"{persona_names[value]} (persona) | {label}"
+        choices.append((label, value))
+    return choices
+
+
+def _api_link_rows(settings: dict, voice_values: set[str]) -> list[tuple[str, str, str]]:
+    """(OpenAI name, studio voice, language) per link slot, padded with free names."""
+    rows = []
+    for link in settings.get("links", [])[:API_MAX_LINKS]:
+        name = link.get("openai_voice", "")
+        if name not in OPENAI_VOICES:
+            continue
+        voice = link.get("voice", "")
+        language = link.get("language") or "auto"
+        rows.append(
+            (
+                name,
+                voice if voice in voice_values else "",
+                language if language in LANGUAGES else "auto",
+            )
+        )
+    used = {row[0] for row in rows}
+    spare = [n for n in dict.fromkeys(_API_DEFAULT_NAMES + OPENAI_VOICES) if n not in used]
+    while len(rows) < API_MAX_LINKS:
+        rows.append((spare.pop(0), "", "auto"))
+    return rows
+
+
+def _api_linked_names(settings: dict) -> list[str]:
+    return [l["openai_voice"] for l in settings.get("links", []) if l.get("voice")]
+
+
+def _api_test_voice_update(settings: dict, current: str | None = None):
+    names = _api_linked_names(settings)
+    return gr.update(
+        choices=names, value=current if current in names else (names[0] if names else None)
+    )
+
+
+def _api_status_html() -> str:
+    if api_server.running:
+        url = html_escape.escape(api_server.base_url)
+        return (
+            '<div class="api-status api-status-on"><span class="api-dot"></span>'
+            f"Running at <code>{url}</code></div>"
+        )
+    return '<div class="api-status"><span class="api-dot"></span>Stopped</div>'
+
+
+def _api_message(text: str, ok: bool = True) -> str:
+    css_class = "api-msg" if ok else "api-msg api-msg-error"
+    return f'<div class="{css_class}">{html_escape.escape(text)}</div>'
+
+
+def _api_usage_markdown(settings: dict) -> str:
+    base_url = client_base_url(settings["host"], int(settings["port"]))
+    linked = [l for l in settings.get("links", []) if l.get("voice")]
+    example_voice = linked[0]["openai_voice"] if linked else "alloy"
+    key = "YOUR_API_KEY" if settings.get("api_key") else "not-needed"
+    voices = ", ".join(
+        f"`{l['openai_voice']}` → {voice_display_name(l['voice'])}" for l in linked
+    )
+    lines = [
+        f"**Base URL:** `{base_url}`  ",
+        "**API key:** "
+        + ("the key set on the left" if settings.get("api_key") else "any value (no key set)")
+        + "  ",
+        "**Model:** `tts-1` (any model name is accepted)  ",
+        f"**Voices:** {voices or '*none linked yet*'}",
+    ]
+    if settings["host"] in ("0.0.0.0", "::"):
+        lines += [
+            "",
+            "From other devices on your network, replace `127.0.0.1` with this PC's IP address.",
+        ]
+    lines += [
+        "",
+        "In apps with an OpenAI text-to-speech option (Open WebUI, SillyTavern, ...), "
+        "choose OpenAI as the TTS provider, enter the base URL above, and pick a linked voice.",
+        "",
+        "**Python** (`pip install openai`)",
+        "```python",
+        "from openai import OpenAI",
+        "",
+        "client = OpenAI(",
+        f'    base_url="{base_url}",',
+        f'    api_key="{key}",',
+        ")",
+        "with client.audio.speech.with_streaming_response.create(",
+        '    model="tts-1",',
+        f'    voice="{example_voice}",',
+        '    input="Hello from Qwen3-TTS Studio!",',
+        ") as response:",
+        '    response.stream_to_file("speech.mp3")',
+        "```",
+        "",
+        "**PowerShell**",
+        "```powershell",
+        f'$body = @{{ model = "tts-1"; voice = "{example_voice}"; input = "Hello!" }}',
+        "Invoke-RestMethod -Method Post `",
+        f'  -Uri "{base_url}/audio/speech" `',
+        f'  -Headers @{{ Authorization = "Bearer {key}" }} `',
+        '  -ContentType "application/json" `',
+        "  -Body ($body | ConvertTo-Json) -OutFile speech.mp3",
+        "```",
+    ]
+    return "\n".join(lines)
+
+
+def _api_settings_from_inputs(values) -> dict:
+    """Build API settings from the tab's inputs; raises gr.Error if invalid."""
+    n_link_inputs = API_MAX_LINKS * 3
+    host, port, api_key, autostart = values[n_link_inputs:]
+    links = []
+    seen = set()
+    for i in range(API_MAX_LINKS):
+        name, voice, language = values[i * 3 : i * 3 + 3]
+        if not voice:
+            continue
+        if not name:
+            raise gr.Error(f"Link {i + 1}: choose an OpenAI voice name.")
+        if name in seen:
+            raise gr.Error(
+                f"'{name}' is linked twice. Each OpenAI voice name can only be used once."
+            )
+        seen.add(name)
+        links.append({"openai_voice": name, "voice": voice, "language": language or "auto"})
+
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        port = 0
+    if not 1 <= port <= 65535:
+        raise gr.Error("Port must be a number between 1 and 65535.")
+
+    return {
+        "host": (host or "").strip() or "127.0.0.1",
+        "port": port,
+        "api_key": (api_key or "").strip(),
+        "autostart": bool(autostart),
+        "links": links,
+    }
+
+
+def api_save_settings(*values):
+    """Inputs: link dropdowns, host, port, key, autostart, then the test voice."""
+    settings = _api_settings_from_inputs(values[:-1])
+    save_api_settings(settings)
+    count = len(settings["links"])
+    message = f"Saved {count} voice link{'' if count == 1 else 's'}."
+    if api_server.running and (settings["host"], settings["port"]) != (
+        api_server.host,
+        api_server.port,
+    ):
+        message += " Restart the server to use the new host and port."
+    return (
+        _api_message(message),
+        _api_usage_markdown(settings),
+        _api_test_voice_update(settings, values[-1]),
+    )
+
+
+def api_start_server(*values):
+    """Save the settings, then (re)start the server on the saved host and port."""
+    settings = _api_settings_from_inputs(values[:-1])
+    save_api_settings(settings)
+    api_server.stop()
+    try:
+        api_server.start(settings["host"], settings["port"])
+        message = _api_message(f"Server running at {api_server.base_url}")
+    except RuntimeError as e:
+        message = _api_message(str(e), ok=False)
+    return (
+        _api_status_html(),
+        message,
+        _api_usage_markdown(settings),
+        _api_test_voice_update(settings, values[-1]),
+    )
+
+
+def api_stop_server():
+    was_running = api_server.running
+    api_server.stop()
+    message = "Server stopped." if was_running else "Server is not running."
+    return _api_status_html(), _api_message(message)
+
+
+def api_refresh_voices(*current_values):
+    choices = _get_api_voice_choices()
+    valid = {value for _, value in choices}
+    return [
+        gr.update(choices=choices, value=v if v in valid else "") for v in current_values
+    ]
+
+
+def api_on_tab_select(*current_values):
+    return [_api_status_html(), *api_refresh_voices(*current_values)]
+
+
+def api_test_link(openai_voice, text, speed, progress=gr.Progress()):
+    """Render text through a saved link, exactly as an API request would."""
+    if not openai_voice:
+        raise gr.Error("Link a studio voice and save your settings first.")
+    text = (text or "").strip()
+    if not text:
+        raise gr.Error("Please enter text to generate")
+    link = find_link(load_api_settings(), openai_voice)
+    if link is None:
+        raise gr.Error(f"'{openai_voice}' is not linked. Save your settings first.")
+
+    voice_name = voice_display_name(link["voice"])
+    progress(0.1, desc=f"Generating with {voice_name}...")
+    start_time = time.time()
+    try:
+        audio, sr = synthesize_link(link, text)
+        audio = change_speed(audio, sr, float(speed))
+    except Exception as e:
+        gr.Warning(format_user_error(e))
+        return None, f"❌ Error: {format_user_error(e)}"
+    finally:
+        _gpu_cleanup()
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        out_path = f.name
+    sf.write(out_path, audio, sr)
+    gen_time = time.time() - start_time
+    duration = len(audio) / sr
+    return (
+        out_path,
+        f"Done in {gen_time:.1f}s | Duration: {format_duration(duration)} | "
+        f"{openai_voice} → {voice_name}",
+    )
+
+
+with gr.Blocks(
+    title="Qwen3-TTS Studio", theme=build_theme(), css=custom_css, js=APP_JS
+) as demo:
+    gr.HTML(HEADER_HTML)
 
     current_prompt_data = gr.State(None)
     current_clone_model = gr.State(None)
 
-    with gr.Row():
-        with gr.Column(scale=5):
-            with gr.Tabs() as tabs:
+    with gr.Row(elem_classes=["app-body"]):
+        with gr.Column(scale=5, elem_classes=["main-col"]):
+            with gr.Tabs(elem_classes=["main-tabs"]) as tabs:
                 with gr.TabItem("Preset Voices", id="preset"):
                     with gr.Row():
                         with gr.Column(scale=1):
@@ -3773,12 +2850,10 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
                             )
 
                             cv_audio = gr.Audio(
-                                label="Generated Audio", type="filepath"
+                                label="Generated Audio", type="filepath", interactive=False
                             )
 
                 with gr.TabItem("Clone Voice", id="clone"):
-                    gr.HTML(f"<style>{MULTISAMPLE_CSS}</style>")
-
                     with gr.Row():
                         with gr.Column(scale=1):
                             gr.HTML(
@@ -3890,13 +2965,13 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
                             )
 
                             vc_status = gr.Textbox(label="Status", interactive=False, value="Ready to generate...")
-                            vc_output = gr.Audio(label="Test Output", type="filepath")
+                            vc_output = gr.Audio(label="Test Output", type="filepath", interactive=False)
 
                             gr.HTML(
                                 '<div class="section-header" style="margin-top:1rem;">Save Cloned Voice</div>'
                             )
 
-                            with gr.Row():
+                            with gr.Row(elem_classes=["align-end"]):
                                 vc_name = gr.Textbox(
                                     label="Voice Name",
                                     placeholder="my_custom_voice",
@@ -3982,7 +3057,7 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
                             )
 
                             vd_audio = gr.Audio(
-                                label="Generated Audio", type="filepath"
+                                label="Generated Audio", type="filepath", interactive=False
                             )
 
                 with gr.TabItem("Saved Voices", id="saved"):
@@ -4052,7 +3127,7 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
 
                             sv_status = gr.Textbox(label="Status", interactive=False, value="Ready to generate...")
                             sv_audio = gr.Audio(
-                                label="Generated Audio", type="filepath"
+                                label="Generated Audio", type="filepath", interactive=False
                             )
 
                     sv_style_note = gr.Textbox(visible=False)
@@ -4061,8 +3136,6 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
                     sv_delete_confirm = gr.State(False)
 
                 with gr.TabItem("Personas", id="personas"):
-                    gr.HTML(f"<style>{PERSONA_CSS}</style>")
-
                     gr.Markdown("## Persona Management")
                     gr.Markdown("*Define character personas for your podcast voices*")
 
@@ -4146,7 +3219,7 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
                             )
 
                             persona_preview_audio = gr.Audio(
-                                label="Voice Preview", type="filepath", visible=True
+                                label="Voice Preview", type="filepath", visible=True, interactive=False
                             )
 
                     gr.HTML(
@@ -4492,11 +3565,9 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
                         None
                     )  # Stores {podcast_dir, quality_preset, language}
 
-                    gr.HTML(f"<style>{PROGRESS_CSS}</style>")
-
                     with gr.Row():
                         with gr.Column(scale=1):
-                            with gr.Tabs():
+                            with gr.Tabs(elem_classes=["sub-tabs"]):
                                 with gr.TabItem("AI Generated"):
                                     gr.HTML(
                                         '<div class="section-header">Topic & Style</div>'
@@ -4602,12 +3673,12 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
                                             "Test Connection", size="sm"
                                         )
 
-                                    with gr.Row():
+                                    with gr.Row(elem_classes=["speakers-head"]):
                                         gr.HTML(
-                                            '<div class="section-header" style="margin-top:1rem;">Speakers (1-4)</div>'
+                                            '<div class="section-header">Speakers (1-4)</div>'
                                         )
                                         podcast_refresh_voices_btn = gr.Button(
-                                            "🔄 Refresh",
+                                            "↻ Refresh",
                                             size="sm",
                                             scale=0,
                                             min_width=80,
@@ -4624,7 +3695,7 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
                                         _get_podcast_voice_choices()
                                     )  # Cache once
                                     for i in range(4):
-                                        with gr.Row():
+                                        with gr.Row(elem_classes=["speaker-row", "ai-slot"]):
                                             slot_role = gr.Dropdown(
                                                 choices=ROLES,
                                                 value=_slot_roles[i],
@@ -4682,31 +3753,67 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
                                         "Parse Script", size="sm"
                                     )
                                     custom_script_status = gr.HTML(value="")
-                                    custom_script_parsed_state = gr.State(None)
+
+                                    with gr.Row(elem_classes=["speakers-head"]):
+                                        gr.HTML(
+                                            '<div class="section-header">Speakers (1-4)</div>'
+                                        )
+                                        custom_refresh_voices_btn = gr.Button(
+                                            "↻ Refresh",
+                                            size="sm",
+                                            scale=0,
+                                            min_width=80,
+                                        )
+
+                                    custom_voice_summary = gr.HTML(
+                                        value='<div style="color:#888; font-size:0.9em;">'
+                                        "Name each speaker exactly as in the script (or click "
+                                        '"Parse Script" to fill names), then pick a voice</div>'
+                                    )
 
                                     custom_speaker_slots = []
+                                    custom_preview_buttons = []
                                     for i in range(4):
-                                        with gr.Row(visible=False) as csr:
+                                        with gr.Row(elem_classes=["speaker-row", "custom-slot"]):
                                             csn = gr.Textbox(
                                                 label=f"Speaker {i + 1}",
-                                                interactive=False,
+                                                placeholder="Name in script",
                                                 scale=1,
+                                                min_width=100,
                                             )
                                             csr_role = gr.Dropdown(
                                                 choices=ROLES,
-                                                value="Host" if i == 0 else "Guest",
+                                                value=_slot_roles[i],
                                                 label="Role",
                                                 scale=1,
+                                                min_width=100,
+                                                interactive=True,
                                             )
                                             csv = gr.Dropdown(
                                                 choices=_initial_voice_choices,
                                                 value="",
                                                 label="Voice",
                                                 scale=2,
+                                                min_width=150,
+                                                interactive=True,
+                                                allow_custom_value=False,
                                             )
+                                            cs_preview = gr.Button(
+                                                "▶",
+                                                size="sm",
+                                                scale=0,
+                                                min_width=40,
+                                            )
+                                            custom_preview_buttons.append(cs_preview)
                                         custom_speaker_slots.append(
-                                            (csr, csn, csr_role, csv)
+                                            (csn, csr_role, csv)
                                         )
+
+                                    custom_preview_audio = gr.Audio(
+                                        label="Preview",
+                                        visible=True,
+                                        interactive=False,
+                                    )
 
                                     custom_episode_title = gr.Textbox(
                                         label="Episode Title (Optional)",
@@ -4739,7 +3846,10 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
                                     )
 
                         with gr.Column(scale=2):
-                            gr.HTML('<div class="section-header">Progress</div>')
+                            gr.HTML(
+                                '<div class="section-header">Progress</div>',
+                                elem_classes=["progress-anchor"],
+                            )
 
                             podcast_step_indicator = gr.HTML(
                                 value=create_step_indicator_html(
@@ -4751,62 +3861,27 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
                                 minimum=0,
                                 maximum=100,
                                 value=0,
-                                label="Overall Progress",
+                                label="Overall progress",
                                 interactive=False,
+                                elem_classes=["progress-bar-slider"],
                             )
 
-                            podcast_status = gr.Textbox(
-                                value="Ready to generate...",
-                                label="Status",
-                                interactive=False,
-                            )
-
-                            podcast_time_remaining = gr.Textbox(
-                                value="", label="", interactive=False, show_label=False
-                            )
+                            with gr.Row(elem_classes=["status-row"]):
+                                podcast_status = gr.Textbox(
+                                    value="Ready to generate...",
+                                    label="Status",
+                                    interactive=False,
+                                    scale=3,
+                                )
+                                podcast_time_remaining = gr.Textbox(
+                                    value="",
+                                    label="Time",
+                                    interactive=False,
+                                    scale=1,
+                                    min_width=170,
+                                )
 
                             podcast_error_display = gr.HTML(value="")
-
-                            gr.HTML(
-                                '<div class="section-header" style="margin-top:1rem;">Draft Preview</div>'
-                            )
-
-                            with gr.Row():
-                                with gr.Column(scale=1):
-                                    gr.HTML(
-                                        '<div style="font-weight: 600; margin-bottom: 0.5rem; font-size: 0.85rem;">Outline</div>'
-                                    )
-                                    podcast_outline_html = gr.HTML(
-                                        value='<div class="empty-state">Generate a podcast to see the outline</div>'
-                                    )
-
-                                with gr.Column(scale=2):
-                                    gr.HTML(
-                                        '<div style="font-weight: 600; margin-bottom: 0.5rem; font-size: 0.85rem;">Transcript</div>'
-                                    )
-                                    podcast_transcript_html = gr.HTML(
-                                        value='<div class="empty-state">Generate a podcast to see the transcript</div>'
-                                    )
-
-                            with gr.Accordion(
-                                "Edit Transcript", open=False, visible=False
-                            ) as podcast_edit_accordion:
-                                gr.HTML(
-                                    '<div style="font-size: 0.8rem; color: var(--gray-600); margin-bottom: 0.5rem;">'
-                                    'Edit dialogue text below, then click "Regenerate Audio" to apply changes.</div>'
-                                )
-                                podcast_transcript_editor = gr.Dataframe(
-                                    headers=["Speaker", "Text"],
-                                    datatype=["str", "str"],
-                                    interactive=True,
-                                    wrap=True,
-                                    value=[],
-                                )
-                                podcast_regenerate_btn = gr.Button(
-                                    "Regenerate Audio from Edits",
-                                    variant="primary",
-                                    size="sm",
-                                )
 
                             gr.HTML(
                                 '<div class="section-header" style="margin-top:1rem;">Audio Output</div>'
@@ -4823,53 +3898,85 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
                             )
 
                             gr.HTML(
-                                '<div class="history-section"><div class="history-header">Podcast History</div></div>'
+                                '<div class="section-header" style="margin-top:1rem;">Draft Preview</div>'
                             )
-                            with gr.Row():
-                                podcast_history_search = gr.Textbox(
-                                    placeholder="Search history...",
-                                    show_label=False,
-                                    scale=3,
+
+                            with gr.Tabs(elem_classes=["sub-tabs"]):
+                                with gr.TabItem("Transcript"):
+                                    podcast_transcript_html = gr.HTML(
+                                        value='<div class="empty-state">Generate a podcast to see the transcript</div>'
+                                    )
+                                with gr.TabItem("Outline"):
+                                    podcast_outline_html = gr.HTML(
+                                        value='<div class="empty-state">Generate a podcast to see the outline</div>'
+                                    )
+
+                            with gr.Accordion(
+                                "Edit Transcript", open=False, visible=False
+                            ) as podcast_edit_accordion:
+                                gr.HTML(
+                                    '<div class="hint">'
+                                    'Edit dialogue text below, then click "Regenerate Audio" to apply changes.</div>'
                                 )
-                                podcast_history_favorites = gr.Checkbox(
-                                    label="Favorites only",
-                                    value=False,
-                                    scale=1,
+                                podcast_transcript_editor = gr.Dataframe(
+                                    headers=["Speaker", "Text"],
+                                    datatype=["str", "str"],
+                                    interactive=True,
+                                    wrap=True,
+                                    value=[],
                                 )
-                            podcast_history_display = gr.HTML(
-                                value=format_history_for_display(),
-                                elem_classes=["history-display"],
-                            )
-                            podcast_hist_init = get_podcast_history_initial()
-                            podcast_history_dropdown = gr.Dropdown(
-                                choices=podcast_hist_init[0],
-                                value=podcast_hist_init[1],
-                                label="Select to load",
-                                allow_custom_value=False,
-                            )
-                            podcast_history_metadata = gr.Textbox(
-                                label="Details",
-                                lines=3,
-                                interactive=False,
-                                value=podcast_hist_init[3],
-                            )
-                            podcast_history_audio = gr.Audio(
-                                label="Playback",
-                                type="filepath",
-                                interactive=False,
-                                value=podcast_hist_init[2],
-                            )
-                            with gr.Row(elem_classes=["mini-btn-row"]):
-                                podcast_history_refresh = gr.Button(
-                                    "Refresh", size="sm"
+                                podcast_regenerate_btn = gr.Button(
+                                    "Regenerate Audio from Edits",
+                                    variant="primary",
+                                    size="sm",
                                 )
-                                podcast_history_favorite = gr.Button(
-                                    "★ Favorite", size="sm"
+
+                            with gr.Accordion("Podcast History", open=False):
+                                with gr.Row():
+                                    podcast_history_search = gr.Textbox(
+                                        placeholder="Search history...",
+                                        show_label=False,
+                                        scale=3,
+                                    )
+                                    podcast_history_favorites = gr.Checkbox(
+                                        label="Favorites only",
+                                        value=False,
+                                        scale=1,
+                                    )
+                                podcast_history_display = gr.HTML(
+                                    value=format_history_for_display(),
+                                    elem_classes=["history-display"],
                                 )
-                                podcast_history_delete = gr.Button(
-                                    "Delete", size="sm", variant="stop"
+                                podcast_hist_init = get_podcast_history_initial()
+                                podcast_history_dropdown = gr.Dropdown(
+                                    choices=podcast_hist_init[0],
+                                    value=podcast_hist_init[1],
+                                    label="Select to load",
+                                    allow_custom_value=False,
                                 )
-                            podcast_history_delete_confirm = gr.State(False)
+                                podcast_history_metadata = gr.Textbox(
+                                    label="Details",
+                                    lines=3,
+                                    interactive=False,
+                                    value=podcast_hist_init[3],
+                                )
+                                podcast_history_audio = gr.Audio(
+                                    label="Playback",
+                                    type="filepath",
+                                    interactive=False,
+                                    value=podcast_hist_init[2],
+                                )
+                                with gr.Row(elem_classes=["mini-btn-row"]):
+                                    podcast_history_refresh = gr.Button(
+                                        "Refresh", size="sm"
+                                    )
+                                    podcast_history_favorite = gr.Button(
+                                        "★ Favorite", size="sm"
+                                    )
+                                    podcast_history_delete = gr.Button(
+                                        "Delete", size="sm", variant="stop"
+                                    )
+                                podcast_history_delete_confirm = gr.State(False)
 
                     def on_llm_provider_change(provider_name):
                         """Update defaults when LLM provider changes."""
@@ -5369,13 +4476,14 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
                                 return '<div class="empty-state">No segments</div>'
                             html_parts = []
                             for i, seg in enumerate(segments):
+                                title = html_escape.escape(str(seg.get("title", "Segment")))
+                                desc = html_escape.escape(str(seg.get("description", "")))
                                 html_parts.append(
-                                    f'<div style="margin-bottom: 0.5rem;">'
-                                    f"<strong>{i + 1}. {seg.get('title', 'Segment')}</strong>"
-                                    f'<br><span style="color: #666;">{seg.get("description", "")}</span>'
-                                    f"</div>"
+                                    f'<div class="outline-item"><div class="outline-num">{i + 1}</div>'
+                                    f'<div><div class="outline-title">{title}</div>'
+                                    f'<div class="outline-desc">{desc}</div></div></div>'
                                 )
-                            return "".join(html_parts)
+                            return f'<div class="outline-list">{"".join(html_parts)}</div>'
 
                         yield (
                             create_step_indicator_html(GenerationStep.OUTLINE, 0.0),
@@ -5510,10 +4618,9 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
                                         and outline_path
                                         and Path(outline_path).exists()
                                     ):
-                                        with open(outline_path) as f:
-                                            outline_html = render_outline_html(
-                                                json.load(f)
-                                            )
+                                        outline_html = render_outline_html(
+                                            read_json_file(outline_path)
+                                        )
 
                                     transcript_data = None
                                     editor_rows = []
@@ -5521,8 +4628,7 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
                                         transcript_path
                                         and Path(transcript_path).exists()
                                     ):
-                                        with open(transcript_path) as f:
-                                            transcript_data = json.load(f)
+                                        transcript_data = read_json_file(transcript_path)
                                         if "empty-state" in transcript_html:
                                             transcript_html = (
                                                 _render_podcast_transcript_html(
@@ -5544,14 +4650,19 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
                                         "language": language,
                                     }
 
+                                    done_text, done_html = _podcast_completion_status(
+                                        result.get("failed_clips"),
+                                        "Podcast generated successfully!",
+                                        '<div style="color: #28a745;">Generation complete!</div>',
+                                    )
                                     yield (
                                         create_step_indicator_html(
                                             GenerationStep.COMBINE, 1.0
                                         ),
                                         100,
-                                        "Podcast generated successfully!",
+                                        done_text,
                                         "",
-                                        '<div style="color: #28a745;">Generation complete!</div>',
+                                        done_html,
                                         combined_audio_path,
                                         outline_html,
                                         transcript_html,
@@ -5734,7 +4845,7 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
 
                             def worker():
                                 try:
-                                    clips, combined = (
+                                    clips, combined, failed_clips = (
                                         podcast_orchestrator.generate_audio_only(
                                             transcript=transcript,
                                             speaker_profile=speaker_profile,
@@ -5744,7 +4855,7 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
                                             progress_callback=progress_cb,
                                         )
                                     )
-                                    result_holder.append(str(combined))
+                                    result_holder.append((str(combined), failed_clips))
                                 except Exception as e:
                                     error_holder.append(str(e))
 
@@ -5819,15 +4930,20 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
                                 return
 
                             if result_holder:
-                                combined_path = result_holder[0]
+                                combined_path, failed_clips = result_holder[0]
+                                done_text, done_html = _podcast_completion_status(
+                                    failed_clips,
+                                    "Audio regenerated successfully!",
+                                    '<div style="color: #28a745;">Regeneration complete!</div>',
+                                )
                                 yield (
                                     create_step_indicator_html(
                                         GenerationStep.COMBINE, 1.0
                                     ),
                                     100,
-                                    "Audio regenerated successfully!",
+                                    done_text,
                                     "",
-                                    '<div style="color: #28a745;">Regeneration complete!</div>',
+                                    done_html,
                                     combined_path,
                                     gr.update(value=combined_path, visible=True),
                                     gr.update(
@@ -5867,20 +4983,19 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
                                 ),
                             )
 
-                    def parse_custom_script(script_text):
-                        result = parse_script(script_text)
+                    def parse_custom_script(script_text, *slot_values):
+                        """Fill the speaker slots with the names found in the script.
 
-                        outputs = []
+                        Voices already picked are kept: a slot that already
+                        carries a script speaker's name moves with that name,
+                        and an unnamed slot keeps its voice for the speaker
+                        that lands in it.
+                        """
+                        result = parse_script(script_text)
 
                         if not result.ok:
                             error_html = f'<div style="color: #dc3545;">{"; ".join(result.errors)}</div>'
-                            outputs.append(error_html)
-                            outputs.append(None)
-                            for _ in range(4):
-                                outputs.append(gr.update(visible=False))
-                                outputs.append("")
-                                outputs.append(gr.update())
-                            return tuple(outputs)
+                            return (error_html, *[gr.update()] * len(slot_values))
 
                         speakers = result.speakers
                         count = len(speakers)
@@ -5890,37 +5005,82 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
                             f"({len(result.dialogues)} dialogue lines)</div>"
                         )
 
-                        outputs.append(status_html)
-                        outputs.append(result)
+                        current = [
+                            (
+                                (slot_values[i * 3] or "").strip(),
+                                slot_values[i * 3 + 1],
+                                slot_values[i * 3 + 2] or "",
+                            )
+                            for i in range(len(slot_values) // 3)
+                        ]
+                        by_name = {
+                            name.lower(): (role, voice)
+                            for name, role, voice in current
+                            if name
+                        }
 
-                        for i in range(4):
+                        outputs = [status_html]
+                        for i, (cur_name, cur_role, cur_voice) in enumerate(current):
                             if i < count:
-                                outputs.append(gr.update(visible=True))
-                                outputs.append(speakers[i])
-                                outputs.append(
-                                    gr.update(value="Host" if i == 0 else "Guest")
-                                )
+                                name = speakers[i]
+                                if name.lower() in by_name:
+                                    role, voice = by_name[name.lower()]
+                                elif not cur_name:
+                                    role, voice = cur_role, cur_voice
+                                else:
+                                    role, voice = _slot_roles[i], ""
                             else:
-                                outputs.append(gr.update(visible=False))
-                                outputs.append("")
-                                outputs.append(gr.update())
+                                name, role, voice = "", _slot_roles[i], ""
+                            outputs.extend([name, role, voice])
 
                         return tuple(outputs)
 
                     def on_custom_script_change():
-                        outputs = [
-                            '<div style="color: #888; font-size: 0.9em;">Click "Parse Script" to detect speakers</div>',
-                            None,
-                        ]
-                        for _ in range(4):
-                            outputs.append(gr.update(visible=False))
-                            outputs.append("")
-                            outputs.append(gr.update())
-                        return tuple(outputs)
+                        return '<div style="color: #888; font-size: 0.9em;">Click "Parse Script" to detect speakers and fill their names</div>'
+
+                    def build_custom_voice_summary(*slot_values):
+                        names = []
+                        ready = []
+                        for i in range(len(slot_values) // 3):
+                            name = (slot_values[i * 3] or "").strip()
+                            voice_val = slot_values[i * 3 + 2] or ""
+                            if voice_val and not name:
+                                return (
+                                    '<div style="color:#dc3545;">'
+                                    f"Speaker {i + 1} has a voice but no name. "
+                                    "Enter the name used in the script."
+                                    "</div>"
+                                )
+                            if name:
+                                names.append(name)
+                                if voice_val:
+                                    ready.append(name)
+
+                        lowered = [n.lower() for n in names]
+                        if len(set(lowered)) != len(lowered):
+                            return (
+                                '<div style="color:#dc3545;">'
+                                "Speaker names must be unique."
+                                "</div>"
+                            )
+
+                        count = len(ready)
+                        if count == 0:
+                            return '<div style="color:#888;">Select 1-4 speakers</div>'
+                        if count == 1:
+                            return (
+                                '<div style="color:#28a745;">'
+                                f"1 speaker selected ✓ (Narration mode): {ready[0]}"
+                                "</div>"
+                            )
+                        return (
+                            '<div style="color:#28a745;">'
+                            f"{count} speakers selected ✓: {', '.join(ready)}"
+                            "</div>"
+                        )
 
                     def run_custom_script_generation(
                         script_text,
-                        parsed_state,
                         quality_preset,
                         language,
                         episode_title,
@@ -5954,15 +5114,6 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
                                 gr.update(),
                             )
 
-                        if parsed_state is None or not getattr(
-                            parsed_state, "ok", False
-                        ):
-                            yield error_tuple(
-                                "Script not parsed",
-                                'Click "Parse Script" first to detect speakers and assign voices.',
-                            )
-                            return
-
                         result = parse_script(script_text)
                         if not result.ok:
                             yield error_tuple(
@@ -5970,24 +5121,37 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
                             )
                             return
 
-                        if parsed_state is not None and getattr(
-                            parsed_state, "ok", False
-                        ):
-                            if parsed_state.speakers != result.speakers:
+                        # Match script speakers to slots by name (case-insensitive,
+                        # same as the clip generator); unused slots are ignored.
+                        slots_by_name = {}
+                        for i in range(len(custom_slot_values) // 3):
+                            slot_name = (custom_slot_values[i * 3] or "").strip()
+                            if not slot_name:
+                                continue
+                            if slot_name.lower() in slots_by_name:
                                 yield error_tuple(
-                                    "Script changed since parsing",
-                                    "Click Parse Script again to refresh speaker assignments.",
+                                    f"Duplicate speaker name '{slot_name}'",
+                                    "Each speaker slot needs a unique name.",
                                 )
                                 return
+                            slots_by_name[slot_name.lower()] = (
+                                custom_slot_values[i * 3 + 1],
+                                custom_slot_values[i * 3 + 2],
+                            )
 
                         voice_sels = []
-                        for i in range(len(result.speakers)):
-                            name = custom_slot_values[i * 3]
-                            role = custom_slot_values[i * 3 + 1]
-                            voice_val = custom_slot_values[i * 3 + 2]
+                        for name in result.speakers:
+                            slot = slots_by_name.get(name.lower())
+                            if slot is None:
+                                yield error_tuple(
+                                    f"No speaker slot for '{name}'",
+                                    f'Click "Parse Script" to fill speaker names, or type \'{name}\' into an empty speaker slot.',
+                                )
+                                return
+                            role, voice_val = slot
                             if not voice_val:
                                 yield error_tuple(
-                                    f"Missing voice for speaker {i + 1}",
+                                    f"Missing voice for {name}",
                                     f"Select a voice for '{name}' before generating.",
                                 )
                                 return
@@ -6261,8 +5425,7 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
                                         transcript_path
                                         and Path(transcript_path).exists()
                                     ):
-                                        with open(transcript_path) as f:
-                                            transcript_data = json.load(f)
+                                        transcript_data = read_json_file(transcript_path)
                                         transcript_html = (
                                             _render_podcast_transcript_html(
                                                 transcript_data
@@ -6283,14 +5446,19 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
                                         "language": language,
                                     }
 
+                                    done_text, done_html = _podcast_completion_status(
+                                        result_data.get("failed_clips"),
+                                        "Podcast generated successfully!",
+                                        '<div style="color: #28a745;">Generation complete!</div>',
+                                    )
                                     yield (
                                         create_step_indicator_html(
                                             GenerationStep.COMBINE, 1.0
                                         ),
                                         100,
-                                        "Podcast generated successfully!",
+                                        done_text,
                                         "",
-                                        '<div style="color: #28a745;">Generation complete!</div>',
+                                        done_html,
                                         combined_audio_path,
                                         outline_html,
                                         transcript_html,
@@ -6447,37 +5615,52 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
                         concurrency_id="podcast_regeneration",
                     )
 
+                    custom_slot_inputs = [
+                        component
+                        for slot in custom_speaker_slots
+                        for component in slot
+                    ]
+
                     custom_script_parse_btn.click(
                         fn=parse_custom_script,
-                        inputs=[custom_script_input],
-                        outputs=[custom_script_status, custom_script_parsed_state]
-                        + [
-                            item
-                            for slot in custom_speaker_slots
-                            for item in (slot[0], slot[1], slot[2])
-                        ],
+                        inputs=[custom_script_input] + custom_slot_inputs,
+                        outputs=[custom_script_status] + custom_slot_inputs,
                     )
 
                     custom_script_input.change(
                         fn=on_custom_script_change,
                         inputs=[],
-                        outputs=[custom_script_status, custom_script_parsed_state]
-                        + [
-                            item
-                            for slot in custom_speaker_slots
-                            for item in (slot[0], slot[1], slot[2])
-                        ],
+                        outputs=[custom_script_status],
                     )
 
-                    custom_slot_inputs = []
-                    for _, csn, csr_role, csv in custom_speaker_slots:
-                        custom_slot_inputs.extend([csn, csr_role, csv])
+                    for csn, _, csv in custom_speaker_slots:
+                        for component in (csn, csv):
+                            component.change(
+                                fn=build_custom_voice_summary,
+                                inputs=custom_slot_inputs,
+                                outputs=[custom_voice_summary],
+                                show_progress="hidden",
+                            )
+
+                    custom_refresh_voices_btn.click(
+                        fn=lambda: [
+                            gr.update(choices=_get_podcast_voice_choices())
+                            for _ in custom_speaker_slots
+                        ],
+                        outputs=[slot[2] for slot in custom_speaker_slots],
+                    )
+
+                    for i, preview_btn in enumerate(custom_preview_buttons):
+                        preview_btn.click(
+                            fn=play_podcast_preview,
+                            inputs=[custom_speaker_slots[i][2]],
+                            outputs=[custom_preview_audio],
+                        )
 
                     custom_generate_btn.click(
                         fn=run_custom_script_generation,
                         inputs=[
                             custom_script_input,
-                            custom_script_parsed_state,
                             custom_quality_preset,
                             custom_language,
                             custom_episode_title,
@@ -6561,7 +5744,127 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
                         show_progress="hidden",
                     )
 
-                with gr.TabItem("📋 History", id="history"):
+                with gr.TabItem("OpenAI API", id="openai_api") as api_tab:
+                    _api_settings = load_api_settings()
+                    _api_voice_choices = _get_api_voice_choices()
+                    _api_rows = _api_link_rows(
+                        _api_settings, {value for _, value in _api_voice_choices}
+                    )
+
+                    gr.HTML('<div class="section-header">Voice Links</div>')
+                    gr.Markdown(
+                        "*Link up to 4 of your voices or personas to OpenAI voice names. "
+                        "Apps and chat tools that support OpenAI text-to-speech can then "
+                        "speak with them: point the app at this server and pick a linked name. "
+                        "API speech uses the model's recommended sampling settings, "
+                        "not the Generation settings panel.*",
+                        elem_classes=["info-text"],
+                    )
+
+                    api_link_inputs = []
+                    for i, (row_name, row_voice, row_language) in enumerate(_api_rows):
+                        with gr.Row(elem_classes=["speaker-row", "api-slot"]):
+                            api_link_inputs += [
+                                gr.Dropdown(
+                                    choices=list(OPENAI_VOICES),
+                                    value=row_name,
+                                    label=f"OpenAI Voice {i + 1}",
+                                    interactive=True,
+                                ),
+                                gr.Dropdown(
+                                    choices=_api_voice_choices,
+                                    value=row_voice,
+                                    label="Studio Voice / Persona",
+                                    interactive=True,
+                                ),
+                                gr.Dropdown(
+                                    choices=LANGUAGES,
+                                    value=row_language,
+                                    label="Language",
+                                    interactive=True,
+                                ),
+                            ]
+                    api_voice_dropdowns = api_link_inputs[1::3]
+
+                    with gr.Row():
+                        api_save_btn = gr.Button("Save Settings", variant="primary")
+                        api_refresh_btn = gr.Button("↻ Refresh Voices")
+                    api_message = gr.HTML(value="")
+
+                    with gr.Row():
+                        with gr.Column(scale=1):
+                            gr.HTML('<div class="section-header">Server</div>')
+                            api_status = gr.HTML(value=_api_status_html())
+                            with gr.Row():
+                                api_host = gr.Textbox(
+                                    label="Host",
+                                    value=_api_settings["host"],
+                                    info="127.0.0.1: this PC only. 0.0.0.0: also other devices on your network.",
+                                    scale=2,
+                                )
+                                api_port = gr.Number(
+                                    label="Port",
+                                    value=_api_settings["port"],
+                                    precision=0,
+                                    minimum=1,
+                                    maximum=65535,
+                                    scale=1,
+                                )
+                            api_key_box = gr.Textbox(
+                                label="API Key (optional)",
+                                value=_api_settings["api_key"],
+                                type="password",
+                                info="When set, apps must send this key. Leave empty to accept any key.",
+                            )
+                            api_autostart = gr.Checkbox(
+                                label="Start the API server when the studio launches",
+                                value=bool(_api_settings["autostart"]),
+                            )
+                            with gr.Row():
+                                api_start_btn = gr.Button("Start Server", variant="primary")
+                                api_stop_btn = gr.Button("Stop Server", variant="stop")
+
+                        with gr.Column(scale=1):
+                            gr.HTML('<div class="section-header">Connect Your App</div>')
+                            api_usage = gr.Markdown(value=_api_usage_markdown(_api_settings))
+
+                    gr.HTML('<div class="section-header">Test a Link</div>')
+                    with gr.Row():
+                        with gr.Column(scale=1):
+                            _api_names = _api_linked_names(_api_settings)
+                            api_test_voice = gr.Dropdown(
+                                choices=_api_names,
+                                value=_api_names[0] if _api_names else None,
+                                label="Linked Voice",
+                                info="Uses the saved links, like an API request",
+                            )
+                            api_test_speed = gr.Slider(
+                                API_MIN_SPEED,
+                                API_MAX_SPEED,
+                                value=1.0,
+                                step=0.05,
+                                label="Speed",
+                            )
+                        with gr.Column(scale=2):
+                            api_test_text = gr.Textbox(
+                                label="Text to Speak",
+                                value="Hello! This is my studio voice, speaking through the OpenAI-compatible API.",
+                                lines=3,
+                            )
+                            api_test_btn = gr.Button(
+                                "Generate Test",
+                                variant="primary",
+                                elem_classes=["generate-btn"],
+                                size="lg",
+                            )
+                            api_test_status = gr.Textbox(
+                                label="Status", interactive=False, value="Ready to generate..."
+                            )
+                            api_test_audio = gr.Audio(
+                                label="Test Audio", type="filepath", interactive=False
+                            )
+
+                with gr.TabItem("History", id="history"):
                     gr.HTML('<div class="section-header">Generation History</div>')
                     gr.Markdown(
                         "*Browse, search, and replay your past voice generations.*"
@@ -6623,29 +5926,35 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
                     hist_delete_confirm = gr.State(False)
                     hist_export_file = gr.File(label="Download Export", visible=False)
 
-        with gr.Column(scale=1, elem_classes=["compact-params-panel"]):
-            gr.HTML('<div class="panel-header-compact">Parameters</div>')
-
-            save_indicator = gr.HTML(
-                value='<span class="save-indicator">Settings saved</span>'
-            )
-
-            gr.HTML('<div class="preset-section">')
+        with gr.Column(
+            scale=1, min_width=320, elem_classes=["params-col", "compact-params-panel"]
+        ):
             gr.HTML(
-                '<div style="font-size:0.75rem;font-weight:600;color:var(--gray-700);margin-bottom:0.5rem;">Quick Presets</div>'
+                '<div class="params-title">Generation settings</div>'
+                '<div class="params-sub">Shared by every generation tab</div>'
             )
+            save_indicator = gr.HTML(
+                value='<span class="save-indicator">Settings saved</span>',
+                elem_classes=["save-indicator-wrap"],
+            )
+
+            gr.HTML('<div class="params-label">Quick presets</div>')
             with gr.Row(elem_classes=["preset-btn-group"]):
                 preset_fast = gr.Button(
-                    "Fast", size="sm", elem_classes=["preset-btn-lg"]
+                    "Fast", size="sm", min_width=0, elem_classes=["preset-btn-lg"]
                 )
                 preset_balanced = gr.Button(
-                    "Balanced", size="sm", elem_classes=["preset-btn-lg"]
+                    "Balanced", size="sm", min_width=0, elem_classes=["preset-btn-lg"]
                 )
                 preset_quality = gr.Button(
-                    "Quality", size="sm", elem_classes=["preset-btn-lg"]
+                    "Quality", size="sm", min_width=0, elem_classes=["preset-btn-lg"]
                 )
-            reset_btn = gr.Button("Reset", size="sm", variant="secondary")
-            gr.HTML("</div>")
+            reset_btn = gr.Button(
+                "Reset to defaults",
+                size="sm",
+                variant="secondary",
+                elem_classes=["reset-btn"],
+            )
 
             with gr.Accordion("Basic Parameters", open=True):
                 param_temp = gr.Slider(
@@ -6696,7 +6005,7 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
                     )
 
                 gr.HTML(
-                    '<div style="font-size:0.7rem;color:var(--gray-500);margin:0.5rem 0 0.25rem;font-weight:500;">Subtalker Model (defaults recommended)</div>'
+                    '<div class="params-note">Subtalker model - defaults recommended</div>'
                 )
 
                 with gr.Row(elem_classes=["compact-slider-row"]):
@@ -7117,6 +6426,62 @@ with gr.Blocks(title="Qwen3-TTS Studio", css=custom_css) as demo:
         outputs=[slot[1] for slot in podcast_speaker_slots],
     )
 
+    # The Generate buttons sit at the bottom of the (long) input column while the
+    # progress / status / error messages are at the top of the right column. Bring
+    # them into view when a run starts so the click never looks like a no-op.
+    for _generate_btn in (podcast_generate_btn, custom_generate_btn):
+        _generate_btn.click(
+            fn=None,
+            js="() => { const el = document.querySelector('.progress-anchor'); "
+            "if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' }); }",
+        )
+
+    # OpenAI API tab
+    _api_settings_inputs = api_link_inputs + [
+        api_host,
+        api_port,
+        api_key_box,
+        api_autostart,
+    ]
+    for _api_save_event in (api_save_btn.click, api_autostart.input):
+        _api_save_event(
+            fn=api_save_settings,
+            inputs=_api_settings_inputs + [api_test_voice],
+            outputs=[api_message, api_usage, api_test_voice],
+        )
+    api_start_btn.click(
+        fn=api_start_server,
+        inputs=_api_settings_inputs + [api_test_voice],
+        outputs=[api_status, api_message, api_usage, api_test_voice],
+    )
+    api_stop_btn.click(fn=api_stop_server, outputs=[api_status, api_message])
+    api_refresh_btn.click(
+        fn=api_refresh_voices, inputs=api_voice_dropdowns, outputs=api_voice_dropdowns
+    )
+    api_tab.select(
+        fn=api_on_tab_select,
+        inputs=api_voice_dropdowns,
+        outputs=[api_status] + api_voice_dropdowns,
+        show_progress="hidden",
+    )
+    api_test_btn.click(
+        fn=_disable_btn,
+        outputs=[api_test_btn],
+        queue=False,
+        show_progress="hidden",
+    ).then(
+        fn=api_test_link,
+        inputs=[api_test_voice, api_test_text, api_test_speed],
+        outputs=[api_test_audio, api_test_status],
+        concurrency_limit=1,
+        concurrency_id="generation",
+    ).then(
+        fn=lambda: _enable_btn("Generate Test"),
+        outputs=[api_test_btn],
+        queue=False,
+        show_progress="hidden",
+    )
+
 if __name__ == "__main__":
     print("Starting Qwen3-TTS Studio...")
     print("=" * 50)
@@ -7129,6 +6494,16 @@ if __name__ == "__main__":
     print("  • Export history to ZIP")
     print("=" * 50)
     demo.queue(default_concurrency_limit=1)
+
+    _startup_api_settings = load_api_settings()
+    if _startup_api_settings.get("autostart"):
+        try:
+            api_server.start(
+                _startup_api_settings["host"], int(_startup_api_settings["port"])
+            )
+        except (RuntimeError, ValueError) as e:
+            print(f"[API] OpenAI-compatible API server not started: {e}")
+
     server_name = os.getenv("GRADIO_SERVER_NAME", "127.0.0.1")
     server_port = int(os.getenv("GRADIO_SERVER_PORT", "7860"))
     demo.launch(server_name=server_name, server_port=server_port)
